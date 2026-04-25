@@ -70,12 +70,12 @@ In Xcode:
 2. Set your signing team under Signing & Capabilities
 3. Hit **Cmd + R** to build and run
 
-The app will appear in your menu bar (not the dock). Click the icon to open the panel, grant the permissions it asks for, type into the prompt box or hold Control+Option to talk, and if needed use the Codex sign-in button in the panel to finish ChatGPT auth from inside the app.
+The app will appear in your menu bar (not the dock). Click the icon to open the panel, grant the permissions it asks for, type into the prompt box or hold `ctrl + option` to talk, and if needed use the Codex sign-in button in the panel to finish ChatGPT auth from inside the app.
 
 ### Permissions the app needs
 
 - **Microphone** — for push-to-talk voice capture
-- **Accessibility** — for the global keyboard shortcut (Control + Option)
+- **Accessibility** — for the global keyboard shortcut (`ctrl + option`)
 - **Screen Recording** — for taking screenshots when you use the hotkey
 - **Screen Content** — for ScreenCaptureKit access
 

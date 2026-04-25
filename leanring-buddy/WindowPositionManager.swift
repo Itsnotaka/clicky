@@ -62,7 +62,7 @@ class WindowPositionManager {
 
     /// Opens System Settings to the Accessibility pane.
     static func openAccessibilitySettings() {
-        CompanionPermissionAssistant.shared.present(panel: .accessibility)
+        PermisoAssistant.shared.present(panel: .accessibility)
     }
 
     /// Reveals the running app bundle in Finder so the user can drag it into
@@ -130,7 +130,7 @@ class WindowPositionManager {
 
     /// Opens System Settings to the Screen Recording pane.
     static func openScreenRecordingSettings() {
-        CompanionPermissionAssistant.shared.present(panel: .screenRecording)
+        PermisoAssistant.shared.present(panel: .screenRecording)
     }
 
     static func permissionRequestPresentationDestination(

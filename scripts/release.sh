@@ -44,7 +44,7 @@ RELEASES_DIR="${PROJECT_DIR}/releases"  # where generate_appcast reads DMGs from
 DMG_BACKGROUND="${PROJECT_DIR}/dmg-background.png"
 
 if [ -z "${CLICKY_RELEASE_REPO:-}" ]; then
-    echo "❌ Set CLICKY_RELEASE_REPO to the GitHub repo that hosts Clicky releases, e.g. owner/clicky-releases."
+    echo "Error: Set CLICKY_RELEASE_REPO to the GitHub repo that hosts Clicky releases, e.g. owner/clicky-releases."
     exit 1
 fi
 
@@ -54,7 +54,7 @@ GITHUB_REPO="${CLICKY_RELEASE_REPO}"
 SPARKLE_BIN=$(find ~/Library/Developer/Xcode/DerivedData/leanring-buddy*/SourcePackages/artifacts/sparkle/Sparkle/bin -maxdepth 0 2>/dev/null | head -1)
 
 if [ -z "$SPARKLE_BIN" ]; then
-    echo "❌ Sparkle tools not found. Build the project in Xcode first so SPM downloads Sparkle."
+    echo "Error: Sparkle tools not found. Build the project in Xcode first so SPM downloads Sparkle."
     exit 1
 fi
 
@@ -63,7 +63,7 @@ fi
 # If no arguments are provided, bumps the minor version by 0.1 and build by 1.
 # You can override either or both by passing arguments.
 
-echo "🔍 Checking latest release on GitHub..."
+echo "Checking latest release on GitHub..."
 
 LATEST_TAG=$(gh release view --repo "${GITHUB_REPO}" --json tagName --jq '.tagName' 2>/dev/null || echo "")
 
@@ -115,7 +115,7 @@ TAG="v${MARKETING_VERSION}"
 # Check if this tag already exists on GitHub to prevent accidental duplicates
 if gh release view "${TAG}" --repo "${GITHUB_REPO}" &>/dev/null; then
     echo ""
-    echo "❌ Release ${TAG} already exists on GitHub!"
+    echo "Error: Release ${TAG} already exists on GitHub!"
     echo "   https://github.com/${GITHUB_REPO}/releases/tag/${TAG}"
     echo ""
     echo "   To release a new version, either:"
@@ -126,7 +126,7 @@ if gh release view "${TAG}" --repo "${GITHUB_REPO}" &>/dev/null; then
 fi
 
 echo ""
-echo "🚀 Releasing ${APP_NAME} v${MARKETING_VERSION} (build ${BUILD_NUMBER})"
+echo "Releasing ${APP_NAME} v${MARKETING_VERSION} (build ${BUILD_NUMBER})"
 echo "   Previous: ${LATEST_TAG:-none}"
 echo ""
 
@@ -141,7 +141,7 @@ echo ""
 
 # ── Step 1: Clean build directory ────────────────────────────────────────────
 
-echo "🧹 Cleaning build directory and stale DMGs..."
+echo "Cleaning build directory and stale DMGs..."
 rm -rf "${BUILD_DIR}"
 # Remove any leftover temp DMGs from create-dmg (rw.*.dmg) and the previous
 # same-named DMG so create-dmg and generate_appcast don't choke on duplicates.
@@ -150,7 +150,7 @@ mkdir -p "${BUILD_DIR}" "${EXPORT_DIR}" "${DMG_OUTPUT_DIR}" "${RELEASES_DIR}"
 
 # ── Step 2: Archive ──────────────────────────────────────────────────────────
 
-echo "📦 Archiving..."
+echo "Archiving..."
 xcodebuild archive \
     -scheme "${SCHEME}" \
     -archivePath "${ARCHIVE_PATH}" \
@@ -158,7 +158,7 @@ xcodebuild archive \
     CURRENT_PROJECT_VERSION="${BUILD_NUMBER}" \
     2>&1 | tail -5
 
-echo "✅ Archive created"
+echo "Archive created"
 
 # ── Step 3: Export (signed + notarized) ──────────────────────────────────────
 
@@ -179,14 +179,14 @@ cat > "${EXPORT_OPTIONS}" << 'PLIST'
 </plist>
 PLIST
 
-echo "📤 Exporting (signing + notarizing — this may take a few minutes)..."
+echo "Exporting (signing + notarizing — this may take a few minutes)..."
 xcodebuild -exportArchive \
     -archivePath "${ARCHIVE_PATH}" \
     -exportPath "${EXPORT_DIR}" \
     -exportOptionsPlist "${EXPORT_OPTIONS}" \
     2>&1 | tail -5
 
-echo "✅ Export complete (signed + notarized)"
+echo "Export complete (signed + notarized)"
 
 # ── Step 4: Create DMG ──────────────────────────────────────────────────────
 
@@ -210,10 +210,10 @@ if [ -f "${DMG_BACKGROUND}" ]; then
     )
 fi
 
-echo "💿 Creating DMG..."
+echo "Creating DMG..."
 create-dmg "${CREATE_DMG_ARGUMENTS[@]}" 2>&1 | tail -3
 
-echo "✅ DMG created: ${DMG_PATH}"
+echo "DMG created: ${DMG_PATH}"
 
 # ── Step 5: Notarize the DMG ─────────────────────────────────────────────────
 # The .app inside the DMG is already signed with Developer ID, but the DMG
@@ -221,19 +221,19 @@ echo "✅ DMG created: ${DMG_PATH}"
 # allows users to open it without the "Apple could not verify" warning.
 # Requires stored credentials: xcrun notarytool store-credentials "AC_PASSWORD"
 
-echo "🔏 Notarizing DMG with Apple (this may take a few minutes)..."
+echo "Notarizing DMG with Apple (this may take a few minutes)..."
 xcrun notarytool submit "${DMG_PATH}" \
     --keychain-profile "AC_PASSWORD" \
     --wait
 
-echo "📎 Stapling notarization ticket to DMG..."
+echo "Stapling notarization ticket to DMG..."
 xcrun stapler staple "${DMG_PATH}"
 
-echo "✅ DMG notarized and stapled"
+echo "DMG notarized and stapled"
 
 # ── Step 6: Sign DMG with Sparkle EdDSA key ─────────────────────────────────
 
-echo "🔐 Signing DMG with Sparkle EdDSA key..."
+echo "Signing DMG with Sparkle EdDSA key..."
 "${SPARKLE_BIN}/sign_update" "${DMG_PATH}"
 
 # ── Step 7: Generate / update appcast.xml ────────────────────────────────────
@@ -242,19 +242,19 @@ echo "🔐 Signing DMG with Sparkle EdDSA key..."
 # produces appcast.xml. The --download-url-prefix tells it where users will
 # actually download the DMG from (GitHub Releases).
 
-echo "📡 Generating appcast.xml..."
+echo "Generating appcast.xml..."
 "${SPARKLE_BIN}/generate_appcast" \
     --download-url-prefix "https://github.com/${GITHUB_REPO}/releases/download/${TAG}/" \
     -o "${PROJECT_DIR}/appcast.xml" \
     "${RELEASES_DIR}"
 
-echo "✅ appcast.xml updated"
+echo "appcast.xml updated"
 
 # ── Step 8: Create GitHub Release ────────────────────────────────────────────
 # Create the release first so the DMG download URL is live before we push the
 # appcast that references it.
 
-echo "🏷️  Creating GitHub Release ${TAG}..."
+echo "Creating GitHub Release ${TAG}..."
 gh release create "${TAG}" "${DMG_PATH}" \
     --repo "${GITHUB_REPO}" \
     --title "v${MARKETING_VERSION}" \
@@ -265,7 +265,7 @@ gh release create "${TAG}" "${DMG_PATH}" \
 # The appcast lives in the releases repo, not in the
 # source code repo. We clone it to a temp dir, copy the new appcast, and push.
 
-echo "📝 Pushing appcast.xml to ${GITHUB_REPO}..."
+echo "Pushing appcast.xml to ${GITHUB_REPO}..."
 RELEASES_REPO_DIR=$(mktemp -d)
 git clone --depth 1 "https://github.com/${GITHUB_REPO}.git" "${RELEASES_REPO_DIR}" 2>&1 | tail -2
 cp "${PROJECT_DIR}/appcast.xml" "${RELEASES_REPO_DIR}/appcast.xml"
@@ -278,7 +278,7 @@ rm -rf "${RELEASES_REPO_DIR}"
 
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
-echo "✅ Release v${MARKETING_VERSION} (build ${BUILD_NUMBER}) complete!"
+echo "Release v${MARKETING_VERSION} (build ${BUILD_NUMBER}) complete!"
 echo ""
 echo "   DMG:      ${DMG_PATH}"
 echo "   Appcast:  ${PROJECT_DIR}/appcast.xml"

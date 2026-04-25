@@ -39,10 +39,12 @@ enum CompanionBrowserAutomationPermissionStatus: Equatable {
     case unavailable(browserName: String, statusCode: OSStatus)
 
     var isGranted: Bool {
-        if case .granted = self {
+        switch self {
+        case .granted:
             return true
+        case .checking, .needsPermission, .denied, .noSupportedBrowserRunning, .unavailable:
+            return false
         }
-        return false
     }
 
     var browserName: String? {
@@ -68,7 +70,7 @@ enum CompanionBrowserAutomationPermissionStatus: Equatable {
         case .denied(let browserName):
             return "\(browserName) blocked"
         case .noSupportedBrowserRunning:
-            return "Open Arc first"
+            return "No supported browser running"
         case .unavailable(let browserName, _):
             return "\(browserName) needs setup"
         }
@@ -85,7 +87,8 @@ enum CompanionBrowserAutomationPermissionStatus: Equatable {
         case .denied(let browserName):
             return "Turn on Clicky under \(browserName) in Automation settings."
         case .noSupportedBrowserRunning:
-            return "Open Arc, Chrome, Brave, Edge, Vivaldi, Chromium, or Safari to grant browser control."
+            let supportedBrowserNames = CompanionBrowserAutomationTarget.supportedBrowsers.map(\.displayName).joined(separator: ", ")
+            return "Open a supported browser to grant control: \(supportedBrowserNames)."
         case .unavailable(let browserName, let statusCode):
             return "\(browserName) returned Automation status \(statusCode)."
         }
@@ -98,7 +101,7 @@ enum CompanionBrowserAutomationPermissionStatus: Equatable {
         case .granted:
             return "Granted"
         case .noSupportedBrowserRunning:
-            return "Settings"
+            return "Help"
         case .needsPermission, .denied, .unavailable:
             return "Grant"
         }

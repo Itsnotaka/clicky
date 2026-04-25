@@ -340,6 +340,8 @@ struct BlueCursorView: View {
         }
         .frame(width: screenFrame.width, height: screenFrame.height)
         .ignoresSafeArea()
+        .opacity(shouldHideClickyBecauseMacCursorIsIdle ? 0 : 1)
+        .animation(.easeOut(duration: 0.18), value: companionManager.isClickyHiddenBecauseMacCursorIsIdle)
         .onAppear {
             // Set initial cursor position immediately before starting animation
             let mouseLocation = NSEvent.mouseLocation
@@ -384,6 +386,12 @@ struct BlueCursorView: View {
 
             startNavigatingToElement(screenLocation: screenLocation)
         }
+    }
+
+    private var shouldHideClickyBecauseMacCursorIsIdle: Bool {
+        companionManager.isClickyHiddenBecauseMacCursorIsIdle
+            && buddyNavigationMode == .followingCursor
+            && !showWelcome
     }
 
     /// Whether the buddy triangle should be visible on this screen.

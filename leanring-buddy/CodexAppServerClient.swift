@@ -9,6 +9,19 @@ struct CodexModelOption: Identifiable, Equatable {
     let id: String
     let displayName: String
     let isDefault: Bool
+    let supportedReasoningEfforts: [CodexReasoningEffortOption]
+    let defaultReasoningEffort: String?
+    let additionalSpeedTiers: [String]
+
+    var supportsFastMode: Bool {
+        additionalSpeedTiers.contains("fast")
+    }
+}
+
+struct CodexReasoningEffortOption: Identifiable, Equatable {
+    let id: String
+    let displayName: String
+    let description: String
 }
 
 struct CodexAccountSnapshot: Equatable {
@@ -66,10 +79,13 @@ actor CodexAppServerClient {
 
     private struct ActiveTurn {
         let turnID: String
-        let startedAt: Date
+        let requestStartedAt: Date
+        let turnStartedAt: Date
+        let debugLogLabel: String?
         let onTextChunk: @MainActor @Sendable (String) -> Void
         let continuation: CheckedContinuation<(text: String, duration: TimeInterval), Error>
         var accumulatedText: String
+        var hasLoggedFirstTextChunk: Bool
     }
 
     private struct PendingRequest {
@@ -88,6 +104,44 @@ actor CodexAppServerClient {
     private var stdoutBuffer = ""
     private var stderrBuffer = ""
     private let requestTimeoutNanoseconds: UInt64 = 8_000_000_000
+
+    private static func formattedLogDuration(_ duration: TimeInterval) -> String {
+        if duration < 1 {
+            return "\(Int((duration * 1_000).rounded()))ms"
+        }
+
+        return String(format: "%.2fs", duration)
+    }
+
+    private static func printTiming(label: String?, _ message: String) {
+        guard let label else { return }
+        print("Timing: Codex \(label): \(message)")
+    }
+
+    private static func requestConfigurationDescription(
+        model: String,
+        reasoningEffort: String?,
+        serviceTier: String?
+    ) -> String {
+        let modelDescription = model.isEmpty ? "app-server-default" : model
+        let reasoningEffortDescription = reasoningEffort ?? "default"
+        let serviceTierDescription = serviceTier ?? "standard"
+        return "model=\(modelDescription) effort=\(reasoningEffortDescription) serviceTier=\(serviceTierDescription)"
+    }
+
+    private static func logFirstTextChunkIfNeeded(
+        activeTurn: inout ActiveTurn,
+        notificationName: String
+    ) {
+        guard !activeTurn.hasLoggedFirstTextChunk else { return }
+
+        activeTurn.hasLoggedFirstTextChunk = true
+        let now = Date()
+        printTiming(
+            label: activeTurn.debugLogLabel,
+            "first text via \(notificationName) total=\(formattedLogDuration(now.timeIntervalSince(activeTurn.requestStartedAt))) turn=\(formattedLogDuration(now.timeIntervalSince(activeTurn.turnStartedAt)))"
+        )
+    }
 
     func refreshSnapshot() async throws -> CodexAppServerSnapshot {
         try await ensureConnection()
@@ -141,7 +195,7 @@ actor CodexAppServerClient {
                 throw CodexAppServerError.invalidResponse("Missing ChatGPT device-code payload.")
             }
 
-            print("🔐 Codex device login code: \(userCode)")
+            print("Codex device login code: \(userCode)")
             return verificationURL
         default:
             throw CodexAppServerError.invalidResponse("Unsupported login type \(type).")
@@ -153,21 +207,43 @@ actor CodexAppServerClient {
         developerInstructions: String,
         userPrompt: String,
         model: String,
+        reasoningEffort: String?,
+        serviceTier: String?,
+        debugLogLabel: String? = nil,
         onTextChunk: @escaping @MainActor @Sendable (String) -> Void
     ) async throws -> (text: String, duration: TimeInterval) {
+        let requestStartedAt = Date()
+        Self.printTiming(
+            label: debugLogLabel,
+            "image request started images=\(images.count) \(Self.requestConfigurationDescription(model: model, reasoningEffort: reasoningEffort, serviceTier: serviceTier))"
+        )
+
         let snapshot = try await refreshSnapshot()
+        Self.printTiming(
+            label: debugLogLabel,
+            "snapshot ready total=\(Self.formattedLogDuration(Date().timeIntervalSince(requestStartedAt)))"
+        )
         if snapshot.account.requiresOpenAIAuthentication && !snapshot.account.isSignedIn {
             throw CodexAppServerError.accountAuthenticationRequired
         }
 
         let temporaryImageURLs = try Self.writeTemporaryImages(images: images)
+        Self.printTiming(
+            label: debugLogLabel,
+            "temporary images written count=\(temporaryImageURLs.count) total=\(Self.formattedLogDuration(Date().timeIntervalSince(requestStartedAt)))"
+        )
         defer {
             Self.removeTemporaryFiles(at: temporaryImageURLs)
         }
 
+        let threadRequestStartedAt = Date()
         let threadID = try await ensureThread(
             developerInstructions: developerInstructions,
             model: model
+        )
+        Self.printTiming(
+            label: debugLogLabel,
+            "thread ready thread=\(Self.formattedLogDuration(Date().timeIntervalSince(threadRequestStartedAt))) total=\(Self.formattedLogDuration(Date().timeIntervalSince(requestStartedAt)))"
         )
 
         var input: [[String: Any]] = []
@@ -186,14 +262,22 @@ actor CodexAppServerClient {
             "text": userPrompt
         ])
 
+        let turnStartRequestStartedAt = Date()
         let turnResult = try await requestObject(
             method: "turn/start",
-            params: [
-                "threadId": threadID,
-                "input": input,
-                "model": model,
-                "personality": "friendly"
-            ]
+            params: turnStartParams(
+                [
+                    "threadId": threadID,
+                    "input": input,
+                    "model": model
+                ],
+                reasoningEffort: reasoningEffort,
+                serviceTier: serviceTier
+            )
+        )
+        Self.printTiming(
+            label: debugLogLabel,
+            "turn/start acknowledged request=\(Self.formattedLogDuration(Date().timeIntervalSince(turnStartRequestStartedAt))) total=\(Self.formattedLogDuration(Date().timeIntervalSince(requestStartedAt)))"
         )
 
         guard let turn = turnResult["turn"] as? [String: Any],
@@ -204,10 +288,13 @@ actor CodexAppServerClient {
         return try await withCheckedThrowingContinuation { continuation in
             activeTurn = ActiveTurn(
                 turnID: turnID,
-                startedAt: Date(),
+                requestStartedAt: requestStartedAt,
+                turnStartedAt: Date(),
+                debugLogLabel: debugLogLabel,
                 onTextChunk: onTextChunk,
                 continuation: continuation,
-                accumulatedText: ""
+                accumulatedText: "",
+                hasLoggedFirstTextChunk: false
             )
         }
     }
@@ -216,38 +303,64 @@ actor CodexAppServerClient {
         developerInstructions: String,
         userPrompt: String,
         model: String,
+        reasoningEffort: String?,
+        serviceTier: String?,
         outputSchema: [String: Any]? = nil,
+        debugLogLabel: String? = nil,
         onTextChunk: @escaping @MainActor @Sendable (String) -> Void
     ) async throws -> (text: String, duration: TimeInterval) {
+        let requestStartedAt = Date()
+        Self.printTiming(
+            label: debugLogLabel,
+            "text request started schema=\(outputSchema != nil) \(Self.requestConfigurationDescription(model: model, reasoningEffort: reasoningEffort, serviceTier: serviceTier))"
+        )
+
         let snapshot = try await refreshSnapshot()
+        Self.printTiming(
+            label: debugLogLabel,
+            "snapshot ready total=\(Self.formattedLogDuration(Date().timeIntervalSince(requestStartedAt)))"
+        )
         if snapshot.account.requiresOpenAIAuthentication && !snapshot.account.isSignedIn {
             throw CodexAppServerError.accountAuthenticationRequired
         }
 
+        let threadRequestStartedAt = Date()
         let threadID = try await ensureThread(
             developerInstructions: developerInstructions,
             model: model
         )
+        Self.printTiming(
+            label: debugLogLabel,
+            "thread ready thread=\(Self.formattedLogDuration(Date().timeIntervalSince(threadRequestStartedAt))) total=\(Self.formattedLogDuration(Date().timeIntervalSince(requestStartedAt)))"
+        )
 
-        var turnParams: [String: Any] = [
-            "threadId": threadID,
-            "input": [
-                [
-                    "type": "text",
-                    "text": userPrompt
-                ]
+        var turnParams = turnStartParams(
+            [
+                "threadId": threadID,
+                "input": [
+                    [
+                        "type": "text",
+                        "text": userPrompt
+                    ]
+                ],
+                "model": model
             ],
-            "model": model,
-            "personality": "friendly"
-        ]
+            reasoningEffort: reasoningEffort,
+            serviceTier: serviceTier
+        )
 
         if let outputSchema {
             turnParams["outputSchema"] = outputSchema
         }
 
+        let turnStartRequestStartedAt = Date()
         let turnResult = try await requestObject(
             method: "turn/start",
             params: turnParams
+        )
+        Self.printTiming(
+            label: debugLogLabel,
+            "turn/start acknowledged request=\(Self.formattedLogDuration(Date().timeIntervalSince(turnStartRequestStartedAt))) total=\(Self.formattedLogDuration(Date().timeIntervalSince(requestStartedAt)))"
         )
 
         guard let turn = turnResult["turn"] as? [String: Any],
@@ -258,10 +371,13 @@ actor CodexAppServerClient {
         return try await withCheckedThrowingContinuation { continuation in
             activeTurn = ActiveTurn(
                 turnID: turnID,
-                startedAt: Date(),
+                requestStartedAt: requestStartedAt,
+                turnStartedAt: Date(),
+                debugLogLabel: debugLogLabel,
                 onTextChunk: onTextChunk,
                 continuation: continuation,
-                accumulatedText: ""
+                accumulatedText: "",
+                hasLoggedFirstTextChunk: false
             )
         }
     }
@@ -389,6 +505,25 @@ actor CodexAppServerClient {
         return result
     }
 
+    private func turnStartParams(
+        _ baseParams: [String: Any],
+        reasoningEffort: String?,
+        serviceTier: String?
+    ) -> [String: Any] {
+        var params = baseParams
+        params["personality"] = "friendly"
+
+        if let reasoningEffort {
+            params["effort"] = reasoningEffort
+        }
+
+        if let serviceTier {
+            params["serviceTier"] = serviceTier
+        }
+
+        return params
+    }
+
     private func request(method: String, params: [String: Any]) async throws -> Any {
         try await ensureConnection()
 
@@ -489,11 +624,11 @@ actor CodexAppServerClient {
     private static func printServerDiagnostic(_ line: String, codexExecutablePath: String?) {
         if line.contains("exec: node: not found") {
             let codexPath = codexExecutablePath ?? "the Codex executable"
-            print("⚠️ Codex app-server could not find Node.js while running \(codexPath). Clicky adds common Node install paths automatically; if this continues, set CodexCLIPath to a bundled Codex executable or install Node in /opt/homebrew/bin.")
+            print("Warning: Codex app-server could not find Node.js while running \(codexPath). Clicky adds common Node install paths automatically; if this continues, set CodexCLIPath to a bundled Codex executable or install Node in /opt/homebrew/bin.")
             return
         }
 
-        print("🧾 Codex app-server: \(line)")
+        print("Codex app-server: \(line)")
     }
 
     private func handleServerLine(_ line: String) async {
@@ -504,7 +639,7 @@ actor CodexAppServerClient {
         }
 
         guard let jsonObject = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] else {
-            print("⚠️ Codex stdout non-JSON line: \(trimmedLine)")
+            print("Warning: Codex stdout non-JSON line: \(trimmedLine)")
             return
         }
 
@@ -555,6 +690,7 @@ actor CodexAppServerClient {
             }
 
             activeTurn.accumulatedText += delta
+            Self.logFirstTextChunkIfNeeded(activeTurn: &activeTurn, notificationName: method)
             self.activeTurn = activeTurn
             await activeTurn.onTextChunk(activeTurn.accumulatedText)
 
@@ -570,6 +706,7 @@ actor CodexAppServerClient {
             }
 
             activeTurn.accumulatedText = text
+            Self.logFirstTextChunkIfNeeded(activeTurn: &activeTurn, notificationName: method)
             self.activeTurn = activeTurn
             await activeTurn.onTextChunk(text)
 
@@ -586,9 +723,19 @@ actor CodexAppServerClient {
             let status = turn["status"] as? String ?? "failed"
             if status == "completed" {
                 let finalText = activeTurn.accumulatedText
-                let duration = Date().timeIntervalSince(activeTurn.startedAt)
+                let completedAt = Date()
+                let duration = completedAt.timeIntervalSince(activeTurn.turnStartedAt)
+                Self.printTiming(
+                    label: activeTurn.debugLogLabel,
+                    "turn completed turn=\(Self.formattedLogDuration(duration)) total=\(Self.formattedLogDuration(completedAt.timeIntervalSince(activeTurn.requestStartedAt))) responseChars=\(finalText.count)"
+                )
                 activeTurn.continuation.resume(returning: (text: finalText, duration: duration))
             } else {
+                Self.printTiming(
+                    label: activeTurn.debugLogLabel,
+                    "turn ended status=\(status) total=\(Self.formattedLogDuration(Date().timeIntervalSince(activeTurn.requestStartedAt)))"
+                )
+
                 let errorMessage: String
                 if let errorObject = turn["error"] as? [String: Any] {
                     errorMessage = errorObject["message"] as? String ?? "Codex turn failed."
@@ -603,12 +750,12 @@ actor CodexAppServerClient {
 
         case "warning":
             if let message = params["message"] as? String {
-                print("⚠️ Codex warning: \(message)")
+                print("Warning: Codex warning: \(message)")
             }
 
         case "configWarning":
             if let summary = params["summary"] as? String {
-                print("⚠️ Codex config warning: \(summary)")
+                print("Warning: Codex config warning: \(summary)")
             }
 
         default:
@@ -685,8 +832,48 @@ actor CodexAppServerClient {
             return CodexModelOption(
                 id: modelID,
                 displayName: displayName,
-                isDefault: rawModel["isDefault"] as? Bool ?? false
+                isDefault: rawModel["isDefault"] as? Bool ?? false,
+                supportedReasoningEfforts: parseReasoningEffortOptions(from: rawModel),
+                defaultReasoningEffort: rawModel["defaultReasoningEffort"] as? String,
+                additionalSpeedTiers: rawModel["additionalSpeedTiers"] as? [String] ?? []
             )
+        }
+    }
+
+    private static func parseReasoningEffortOptions(from rawModel: [String: Any]) -> [CodexReasoningEffortOption] {
+        guard let rawReasoningEfforts = rawModel["supportedReasoningEfforts"] as? [[String: Any]] else {
+            return []
+        }
+
+        return rawReasoningEfforts.compactMap { rawReasoningEffort in
+            guard let reasoningEffort = rawReasoningEffort["reasoningEffort"] as? String else {
+                return nil
+            }
+
+            return CodexReasoningEffortOption(
+                id: reasoningEffort,
+                displayName: displayName(forReasoningEffort: reasoningEffort),
+                description: rawReasoningEffort["description"] as? String ?? ""
+            )
+        }
+    }
+
+    private static func displayName(forReasoningEffort reasoningEffort: String) -> String {
+        switch reasoningEffort {
+        case "none":
+            return "None"
+        case "minimal":
+            return "Minimal"
+        case "low":
+            return "Low"
+        case "medium":
+            return "Medium"
+        case "high":
+            return "High"
+        case "xhigh":
+            return "Extra High"
+        default:
+            return reasoningEffort
         }
     }
 

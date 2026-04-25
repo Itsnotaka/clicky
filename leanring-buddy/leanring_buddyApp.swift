@@ -2,9 +2,8 @@
 //  leanring_buddyApp.swift
 //  leanring-buddy
 //
-//  Menu bar-only companion app. No dock icon, no main window — just an
-//  always-available status item in the macOS menu bar. Clicking the icon
-//  opens a floating panel with companion voice controls.
+//  Menu bar companion app with a native dashboard control center. No dock icon;
+//  the always-available status item opens a compact native menu.
 //
 
 import Sparkle
@@ -17,7 +16,7 @@ struct leanring_buddyApp: App {
     @NSApplicationDelegateAdaptor(CompanionAppDelegate.self) var appDelegate
 
     var body: some Scene {
-        // The app lives entirely in the menu bar panel managed by the AppDelegate.
+        // The app is managed by the AppDelegate through the menu bar and dashboard.
         // This empty Settings scene satisfies SwiftUI's requirement for at least
         // one scene but is never shown (LSUIElement=true removes the app menu).
         Settings {
@@ -36,7 +35,7 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown"
-        print("🎯 Clicky starting")
+        print("Clicky starting")
         print("   Version: \(version)")
 
         UserDefaults.standard.register(defaults: ["NSInitialToolTipDelay": 0])
@@ -46,10 +45,10 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
             clickyUpdaterManager: clickyUpdaterManager
         )
         companionManager.start()
-        // Auto-open the panel if the user still needs to do something:
+        // Auto-open the dashboard if the user still needs to do something:
         // either they haven't onboarded yet, or permissions were revoked.
         if !companionManager.hasCompletedOnboarding || !companionManager.allPermissionsGranted {
-            menuBarPanelManager?.showPanelOnLaunch()
+            menuBarPanelManager?.showDashboardOnLaunch()
         }
         registerAsLoginItemIfNeeded()
         clickyUpdaterManager.start()
@@ -67,9 +66,9 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
         if loginItemService.status != .enabled {
             do {
                 try loginItemService.register()
-                print("🎯 Clicky: Registered as login item")
+                print("Clicky: Registered as login item")
             } catch {
-                print("⚠️ Clicky: Failed to register as login item: \(error)")
+                print("Warning: Clicky: Failed to register as login item: \(error)")
             }
         }
     }
@@ -99,7 +98,7 @@ final class ClickyUpdaterManager: NSObject, ObservableObject {
             refreshUpdateAvailability()
             updateStatusText = "Updates: Ready"
         } catch {
-            print("⚠️ Clicky: Sparkle updater failed to start: \(error)")
+            print("Warning: Clicky: Sparkle updater failed to start: \(error)")
             updateStatusText = "Updates: Unavailable"
         }
     }

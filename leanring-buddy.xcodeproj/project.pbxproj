@@ -39,16 +39,6 @@
 			path = "leanring-buddy";
 			sourceTree = "<group>";
 		};
-		28F22CCF2F56440300A0FC59 /* leanring-buddyTests */ = {
-			isa = PBXFileSystemSynchronizedRootGroup;
-			path = "leanring-buddyTests";
-			sourceTree = "<group>";
-		};
-		28F22CD92F56440300A0FC59 /* leanring-buddyUITests */ = {
-			isa = PBXFileSystemSynchronizedRootGroup;
-			path = "leanring-buddyUITests";
-			sourceTree = "<group>";
-		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -81,8 +71,6 @@
 			isa = PBXGroup;
 			children = (
 				28F22CC12F56440300A0FC59 /* leanring-buddy */,
-				28F22CCF2F56440300A0FC59 /* leanring-buddyTests */,
-				28F22CD92F56440300A0FC59 /* leanring-buddyUITests */,
 				28F22CC02F56440300A0FC59 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -136,9 +124,6 @@
 			dependencies = (
 				28F22CCE2F56440300A0FC59 /* PBXTargetDependency */,
 			);
-			fileSystemSynchronizedGroups = (
-				28F22CCF2F56440300A0FC59 /* leanring-buddyTests */,
-			);
 			name = "leanring-buddyTests";
 			packageProductDependencies = (
 			);
@@ -158,9 +143,6 @@
 			);
 			dependencies = (
 				28F22CD82F56440300A0FC59 /* PBXTargetDependency */,
-			);
-			fileSystemSynchronizedGroups = (
-				28F22CD92F56440300A0FC59 /* leanring-buddyUITests */,
 			);
 			name = "leanring-buddyUITests";
 			packageProductDependencies = (

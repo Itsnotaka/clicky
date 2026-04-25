@@ -1,15 +1,15 @@
 //
-//  CompanionPermissionAssistant.swift
+//  PermisoAssistant.swift
 //  leanring-buddy
 //
-//  Lightweight System Settings permission guide inspired by zats/permiso.
+//  Lightweight System Settings permission guide using the zats/permiso API shape.
 //
 
 import AppKit
 import Foundation
 import SwiftUI
 
-enum CompanionPermissionSettingsPane: Equatable {
+enum PermisoPanel: Equatable {
     case accessibility
     case screenRecording
     case automation(targetApplicationName: String?)
@@ -40,10 +40,6 @@ enum CompanionPermissionSettingsPane: Equatable {
         URL(string: "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?\(settingsIdentifier)")!
     }
 
-    var fallbackSettingsURL: URL {
-        URL(string: "x-apple.systempreferences:com.apple.preference.security?\(settingsIdentifier)")!
-    }
-
     var showsAppDragSource: Bool {
         switch self {
         case .accessibility, .screenRecording:
@@ -53,10 +49,10 @@ enum CompanionPermissionSettingsPane: Equatable {
         }
     }
 
-    var guideText: String {
+    func guideText(appBundleName: String) -> String {
         switch self {
         case .accessibility, .screenRecording:
-            return "Drag Clicky into the list above to allow \(title)."
+            return "Drag \(appBundleName) into the list above to allow \(title)."
         case .automation(let targetApplicationName):
             if let targetApplicationName {
                 return "Turn on Clicky under \(targetApplicationName) to allow background browser actions."
@@ -67,17 +63,15 @@ enum CompanionPermissionSettingsPane: Equatable {
 }
 
 @MainActor
-final class CompanionPermissionAssistant {
-    static let shared = CompanionPermissionAssistant()
+final class PermisoAssistant {
+    static let shared = PermisoAssistant()
 
     private var overlayController: CompanionPermissionGuideWindowController?
     private var trackingTimer: Timer?
     private var activationObserver: NSObjectProtocol?
-    private var activePane: CompanionPermissionSettingsPane?
     private var didPresentCurrentOverlay = false
 
-    func present(panel: CompanionPermissionSettingsPane) {
-        activePane = panel
+    func present(panel: PermisoPanel) {
         didPresentCurrentOverlay = false
         overlayController = CompanionPermissionGuideWindowController(panel: panel) { [weak self] in
             self?.dismiss()
@@ -98,14 +92,11 @@ final class CompanionPermissionAssistant {
 
         overlayController?.close()
         overlayController = nil
-        activePane = nil
         didPresentCurrentOverlay = false
     }
 
-    private func openSettings(_ panel: CompanionPermissionSettingsPane) {
-        if !NSWorkspace.shared.open(panel.settingsURL) {
-            NSWorkspace.shared.open(panel.fallbackSettingsURL)
-        }
+    private func openSettings(_ panel: PermisoPanel) {
+        NSWorkspace.shared.open(panel.settingsURL)
     }
 
     private func startTracking() {
@@ -149,34 +140,32 @@ final class CompanionPermissionAssistant {
     }
 }
 
-private struct CompanionPermissionHostApp {
-    let displayName: String
+private struct PermisoHostApp {
     let bundleURL: URL
     let icon: NSImage
 
-    static func current(bundle: Bundle = .main) -> CompanionPermissionHostApp {
-        let displayName = bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String
-            ?? bundle.object(forInfoDictionaryKey: kCFBundleNameKey as String) as? String
-            ?? bundle.bundleURL.deletingPathExtension().lastPathComponent
+    static func current(bundle: Bundle = .main) -> PermisoHostApp {
         let icon = NSWorkspace.shared.icon(forFile: bundle.bundleURL.path)
         icon.size = NSSize(width: 48, height: 48)
-        return CompanionPermissionHostApp(displayName: displayName, bundleURL: bundle.bundleURL, icon: icon)
+        return PermisoHostApp(bundleURL: bundle.bundleURL, icon: icon)
     }
 }
 
 private final class CompanionPermissionGuideWindowController: NSWindowController {
     private let windowSize = NSSize(width: 520, height: 116)
+    private let guideWindow: NSWindow
 
-    init(panel: CompanionPermissionSettingsPane, onBack: @escaping () -> Void) {
-        let window = CompanionPermissionGuidePanel(
+    init(panel: PermisoPanel, onBack: @escaping () -> Void) {
+        let guideWindow = CompanionPermissionGuidePanel(
             contentRect: NSRect(origin: .zero, size: windowSize),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
-        super.init(window: window)
-        configureWindow(window)
-        window.contentView = NSHostingView(
+        self.guideWindow = guideWindow
+        super.init(window: guideWindow)
+        configureWindow(guideWindow)
+        guideWindow.contentView = NSHostingView(
             rootView: CompanionPermissionGuideView(
                 panel: panel,
                 hostApp: .current(),
@@ -191,24 +180,23 @@ private final class CompanionPermissionGuideWindowController: NSWindowController
     }
 
     override func close() {
-        window?.orderOut(nil)
+        guideWindow.orderOut(nil)
         super.close()
     }
 
     func present(settingsFrame: CGRect, visibleFrame: CGRect) {
-        guard let window else { return }
-        window.alphaValue = 1
-        window.setFrame(NSRect(origin: anchoredOrigin(for: settingsFrame, visibleFrame: visibleFrame), size: windowSize), display: false)
-        window.orderFrontRegardless()
+        guideWindow.alphaValue = 1
+        guideWindow.setFrame(NSRect(origin: anchoredOrigin(for: settingsFrame, visibleFrame: visibleFrame), size: windowSize), display: false)
+        guideWindow.orderFrontRegardless()
     }
 
     func updatePosition(settingsFrame: CGRect, visibleFrame: CGRect) {
-        window?.setFrameOrigin(anchoredOrigin(for: settingsFrame, visibleFrame: visibleFrame))
-        window?.orderFrontRegardless()
+        guideWindow.setFrameOrigin(anchoredOrigin(for: settingsFrame, visibleFrame: visibleFrame))
+        guideWindow.orderFrontRegardless()
     }
 
     func hide() {
-        window?.orderOut(nil)
+        guideWindow.orderOut(nil)
     }
 
     private func configureWindow(_ window: NSWindow) {
@@ -245,8 +233,8 @@ private final class CompanionPermissionGuidePanel: NSPanel {
 }
 
 private struct CompanionPermissionGuideView: View {
-    let panel: CompanionPermissionSettingsPane
-    let hostApp: CompanionPermissionHostApp
+    let panel: PermisoPanel
+    let hostApp: PermisoHostApp
     let onBack: () -> Void
 
     var body: some View {
@@ -267,7 +255,7 @@ private struct CompanionPermissionGuideView: View {
                         .font(.system(size: 22, weight: .bold))
                         .foregroundStyle(Color(red: 0.15, green: 0.54, blue: 0.98))
 
-                    Text(panel.guideText)
+                    Text(panel.guideText(appBundleName: hostApp.bundleURL.lastPathComponent))
                         .font(.system(size: 13, weight: .medium))
                         .foregroundStyle(.primary.opacity(0.84))
                         .lineLimit(2)
@@ -292,7 +280,7 @@ private struct CompanionPermissionGuideView: View {
 }
 
 private struct CompanionPermissionAppDragSource: NSViewRepresentable {
-    let hostApp: CompanionPermissionHostApp
+    let hostApp: PermisoHostApp
 
     func makeNSView(context: Context) -> CompanionPermissionAppDragSourceView {
         CompanionPermissionAppDragSourceView(hostApp: hostApp)
@@ -302,12 +290,12 @@ private struct CompanionPermissionAppDragSource: NSViewRepresentable {
 }
 
 private final class CompanionPermissionAppDragSourceView: NSView, NSPasteboardItemDataProvider, NSDraggingSource {
-    private let hostApp: CompanionPermissionHostApp
+    private let hostApp: PermisoHostApp
     private let rowView = NSView()
     private let iconChrome = NSView()
     private let label = NSTextField(labelWithString: "")
 
-    init(hostApp: CompanionPermissionHostApp) {
+    init(hostApp: PermisoHostApp) {
         self.hostApp = hostApp
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
@@ -377,7 +365,7 @@ private final class CompanionPermissionAppDragSourceView: NSView, NSPasteboardIt
         iconView.imageScaling = .scaleProportionallyUpOrDown
         iconChrome.addSubview(iconView)
 
-        label.stringValue = hostApp.displayName
+        label.stringValue = hostApp.bundleURL.lastPathComponent
         label.font = .systemFont(ofSize: 14, weight: .semibold)
         label.textColor = NSColor.labelColor.withAlphaComponent(0.82)
         label.translatesAutoresizingMaskIntoConstraints = false

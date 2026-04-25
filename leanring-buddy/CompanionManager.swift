@@ -9,8 +9,10 @@
 
 import AVFoundation
 import Combine
+import CoreGraphics
 import Foundation
 import ScreenCaptureKit
+import Speech
 import SwiftUI
 
 enum CompanionVoiceState {
@@ -27,14 +29,38 @@ enum CodexConnectionState: Equatable {
     case unavailable(message: String)
 }
 
+private enum CompanionResponseInputSource {
+    case typedPrompt
+    case voiceTranscript
+
+    var logName: String {
+        switch self {
+        case .typedPrompt:
+            return "typed input"
+        case .voiceTranscript:
+            return "voice input"
+        }
+    }
+}
+
 @MainActor
 final class CompanionManager: ObservableObject {
+    private static let macCursorIdleHideDelaySeconds: CFTimeInterval = 3.0
+    private static let macCursorIdleTrackingIntervalSeconds: TimeInterval = 0.12
+    private static let macCursorMovementEventTypes: [CGEventType] = [
+        .mouseMoved,
+        .leftMouseDragged,
+        .rightMouseDragged,
+        .otherMouseDragged
+    ]
+
     @Published private(set) var voiceState: CompanionVoiceState = .idle
     @Published private(set) var lastTranscript: String?
     @Published private(set) var currentAudioPowerLevel: CGFloat = 0
     @Published private(set) var hasAccessibilityPermission = false
     @Published private(set) var hasScreenRecordingPermission = false
     @Published private(set) var hasMicrophonePermission = false
+    @Published private(set) var hasSpeechRecognitionPermission = false
     @Published private(set) var hasScreenContentPermission = false
     @Published private(set) var browserAutomationPermissionStatus: CompanionBrowserAutomationPermissionStatus = .checking
 
@@ -65,6 +91,7 @@ final class CompanionManager: ObservableObject {
     let buddyDictationManager = BuddyDictationManager()
     let globalPushToTalkShortcutMonitor = GlobalPushToTalkShortcutMonitor()
     let overlayWindowManager = OverlayWindowManager()
+    let computerUseWindowContextController = CompanionComputerUseWindowContextController()
     // Response text is now displayed inline on the cursor overlay via
     // streamingResponseText, so no separate response overlay manager is needed.
 
@@ -85,13 +112,18 @@ final class CompanionManager: ObservableObject {
     /// Scheduled hide for transient cursor mode — cancelled if the user
     /// speaks again before the delay elapses.
     private var transientHideTask: Task<Void, Never>?
+    private var macCursorIdleTrackingTimer: Timer?
     private var codexSignInPollingTask: Task<Void, Never>?
     private var hasStartedAgentPipeline = false
 
-    /// True when the core voice and screen permissions are granted.
-    /// Browser Automation is optional and tracked separately per target app.
+    /// True when the permissions required to launch Clicky's cursor experience are granted.
+    /// Speech Recognition and Browser Automation are still checked and shown in the UI,
+    /// but they should not hide the overlay cursor if unavailable or revoked.
     var allPermissionsGranted: Bool {
-        hasAccessibilityPermission && hasScreenRecordingPermission && hasMicrophonePermission && hasScreenContentPermission
+        hasAccessibilityPermission
+            && hasScreenRecordingPermission
+            && hasMicrophonePermission
+            && hasScreenContentPermission
     }
 
     /// Whether the blue cursor overlay is currently visible on screen.
@@ -99,7 +131,9 @@ final class CompanionManager: ObservableObject {
     @Published private(set) var isOverlayVisible: Bool = false
 
     /// The Codex model used for voice responses. Persisted to UserDefaults.
-    @Published var selectedModel: String = UserDefaults.standard.string(forKey: "selectedCodexModel") ?? "gpt-5.4"
+    @Published var selectedModel: String = UserDefaults.standard.string(forKey: "selectedCodexModel") ?? ""
+    @Published var selectedReasoningEffort: String = UserDefaults.standard.string(forKey: "selectedCodexReasoningEffort") ?? ""
+    @Published var isFastModeEnabled: Bool = UserDefaults.standard.bool(forKey: "isCodexFastModeEnabled")
     @Published private(set) var availableModels: [CodexModelOption] = []
     @Published private(set) var codexConnectionState: CodexConnectionState = .checking
 
@@ -126,6 +160,17 @@ final class CompanionManager: ObservableObject {
     func setSelectedModel(_ model: String) {
         selectedModel = model
         UserDefaults.standard.set(model, forKey: "selectedCodexModel")
+        normalizeSelectedCodexModelSettings()
+    }
+
+    func setSelectedReasoningEffort(_ reasoningEffort: String) {
+        selectedReasoningEffort = reasoningEffort
+        UserDefaults.standard.set(reasoningEffort, forKey: "selectedCodexReasoningEffort")
+    }
+
+    func setFastModeEnabled(_ enabled: Bool) {
+        isFastModeEnabled = enabled && selectedModelSupportsFastMode
+        UserDefaults.standard.set(isFastModeEnabled, forKey: "isCodexFastModeEnabled")
     }
 
     var speechOutputDisplayName: String {
@@ -133,7 +178,52 @@ final class CompanionManager: ObservableObject {
     }
 
     var selectedModelDisplayName: String {
-        availableModels.first(where: { $0.id == selectedModel })?.displayName ?? selectedModel
+        availableModels.first(where: { $0.id == selectedModel })?.displayName ?? (selectedModel.isEmpty ? "Default" : selectedModel)
+    }
+
+    var selectedModelReasoningEfforts: [CodexReasoningEffortOption] {
+        selectedModelOption?.supportedReasoningEfforts ?? []
+    }
+
+    var selectedReasoningEffortDisplayName: String {
+        selectedModelReasoningEfforts.first(where: { $0.id == selectedReasoningEffort })?.displayName ?? selectedReasoningEffort
+    }
+
+    var selectedModelSupportsFastMode: Bool {
+        selectedModelOption?.supportsFastMode == true
+    }
+
+    private var selectedModelOption: CodexModelOption? {
+        availableModels.first(where: { $0.id == selectedModel })
+    }
+
+    private var selectedReasoningEffortForCodexRequest: String? {
+        selectedReasoningEffort.isEmpty ? selectedModelOption?.defaultReasoningEffort : selectedReasoningEffort
+    }
+
+    private var selectedServiceTierForCodexRequest: String? {
+        isFastModeEnabled && selectedModelSupportsFastMode ? "fast" : nil
+    }
+
+    private static func formattedResponseLogDuration(_ duration: TimeInterval) -> String {
+        if duration < 1 {
+            return "\(Int((duration * 1_000).rounded()))ms"
+        }
+
+        return String(format: "%.2fs", duration)
+    }
+
+    private func printResponseTiming(
+        source: CompanionResponseInputSource,
+        _ message: String,
+        since startDate: Date? = nil
+    ) {
+        if let startDate {
+            let elapsedDuration = Date().timeIntervalSince(startDate)
+            print("Timing: Clicky \(source.logName) +\(Self.formattedResponseLogDuration(elapsedDuration)): \(message)")
+        } else {
+            print("Timing: Clicky \(source.logName): \(message)")
+        }
     }
 
     func refreshCodexConnectionState() {
@@ -203,6 +293,8 @@ final class CompanionManager: ObservableObject {
             setSelectedModel(defaultModelID)
         }
 
+        normalizeSelectedCodexModelSettings()
+
         if snapshot.account.requiresOpenAIAuthentication && !snapshot.account.isSignedIn {
             codexConnectionState = .needsSignIn
             return
@@ -211,12 +303,48 @@ final class CompanionManager: ObservableObject {
         codexConnectionState = .ready(planType: snapshot.account.planType)
     }
 
-    /// User preference for whether the Clicky cursor should be shown.
-    /// When toggled off, the overlay is hidden and push-to-talk is disabled.
+    private func normalizeSelectedCodexModelSettings() {
+        guard let selectedModelOption else { return }
+
+        if !selectedModelOption.supportedReasoningEfforts.contains(where: { $0.id == selectedReasoningEffort }) {
+            let defaultReasoningEffort = selectedModelOption.defaultReasoningEffort
+                ?? selectedModelOption.supportedReasoningEfforts.first?.id
+                ?? ""
+            selectedReasoningEffort = defaultReasoningEffort
+            UserDefaults.standard.set(defaultReasoningEffort, forKey: "selectedCodexReasoningEffort")
+        }
+
+        if isFastModeEnabled && !selectedModelOption.supportsFastMode {
+            isFastModeEnabled = false
+            UserDefaults.standard.set(false, forKey: "isCodexFastModeEnabled")
+        }
+    }
+
+    /// User preference for whether the Clicky cursor should stay visible.
+    /// When toggled off, push-to-talk shows the overlay transiently for the interaction.
     /// Persisted to UserDefaults so the choice survives app restarts.
     @Published var isClickyCursorEnabled: Bool = UserDefaults.standard.object(forKey: "isClickyCursorEnabled") == nil
         ? true
         : UserDefaults.standard.bool(forKey: "isClickyCursorEnabled")
+
+    /// Mirrors macOS-style cursor idle behavior by fading Clicky after the
+    /// mouse stops moving, then revealing it again on movement.
+    @Published var shouldHideClickyWhenMacCursorIsIdle: Bool = UserDefaults.standard.object(forKey: "shouldHideClickyWhenMacCursorIsIdle") == nil
+        ? true
+        : UserDefaults.standard.bool(forKey: "shouldHideClickyWhenMacCursorIsIdle")
+    @Published private(set) var isClickyHiddenBecauseMacCursorIsIdle = false
+
+    func setClickyHidesWhenMacCursorIsIdle(_ enabled: Bool) {
+        shouldHideClickyWhenMacCursorIsIdle = enabled
+        UserDefaults.standard.set(enabled, forKey: "shouldHideClickyWhenMacCursorIsIdle")
+
+        if enabled {
+            isClickyHiddenBecauseMacCursorIsIdle = false
+            startMacCursorIdleTrackingIfNeeded()
+        } else {
+            stopMacCursorIdleTracking()
+        }
+    }
 
     func setClickyCursorEnabled(_ enabled: Bool) {
         isClickyCursorEnabled = enabled
@@ -225,6 +353,7 @@ final class CompanionManager: ObservableObject {
         transientHideTask = nil
 
         if enabled && isAgentRunning {
+            isClickyHiddenBecauseMacCursorIsIdle = false
             overlayWindowManager.hasShownOverlayBefore = true
             overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
             isOverlayVisible = true
@@ -237,10 +366,13 @@ final class CompanionManager: ObservableObject {
     func submitTypedPrompt(_ prompt: String) {
         guard isAgentRunning else { return }
 
+        let promptSubmittedAt = Date()
         let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedPrompt.isEmpty else { return }
 
         lastTranscript = trimmedPrompt
+        NotificationCenter.default.post(name: .clickyDismissPanel, object: nil)
+        isClickyHiddenBecauseMacCursorIsIdle = false
 
         if !isOverlayVisible {
             overlayWindowManager.hasShownOverlayBefore = true
@@ -248,7 +380,11 @@ final class CompanionManager: ObservableObject {
             isOverlayVisible = true
         }
 
-        sendTranscriptToCodexWithScreenshot(transcript: trimmedPrompt)
+        sendTranscriptToCodexWithScreenshot(
+            transcript: trimmedPrompt,
+            source: .typedPrompt,
+            inputReceivedAt: promptSubmittedAt
+        )
     }
 
     /// Whether the user has completed onboarding at least once. Persisted
@@ -268,11 +404,13 @@ final class CompanionManager: ObservableObject {
 
         hasStartedAgentPipeline = true
         refreshAllPermissions()
+        computerUseWindowContextController.refresh(screenContentGranted: hasScreenContentPermission)
         printStartupState()
         startPermissionPolling()
         bindVoiceStateObservation()
         bindAudioPowerLevel()
         bindShortcutTransitions()
+        startMacCursorIdleTrackingIfNeeded()
         // Warm up the local Codex bridge early so login/model state is ready
         // before the user first tries to talk to Clicky.
         refreshCodexConnectionState()
@@ -289,10 +427,11 @@ final class CompanionManager: ObservableObject {
     }
 
     private func printStartupState() {
-        print("🔑 Startup state")
+        print("Startup state")
         print("   Accessibility: \(permissionStatusText(hasAccessibilityPermission))")
         print("   Screen Recording: \(permissionStatusText(hasScreenRecordingPermission))")
         print("   Microphone: \(permissionStatusText(hasMicrophonePermission))")
+        print("   Speech Recognition: \(permissionStatusText(hasSpeechRecognitionPermission))")
         print("   Screen Content: \(permissionStatusText(hasScreenContentPermission))")
         print("   Browser Automation: \(browserAutomationPermissionStatus.statusText)")
         print("   Onboarding: \(hasCompletedOnboarding ? "completed" : "not completed")")
@@ -309,7 +448,7 @@ final class CompanionManager: ObservableObject {
             browserAutomationPermissionStatus = permissionStatus
 
             if !permissionStatus.isGranted {
-                CompanionPermissionAssistant.shared.present(
+                PermisoAssistant.shared.present(
                     panel: .automation(targetApplicationName: permissionStatus.browserName)
                 )
             }
@@ -317,7 +456,7 @@ final class CompanionManager: ObservableObject {
     }
 
     func openBrowserAutomationPermissionHelper() {
-        CompanionPermissionAssistant.shared.present(
+        PermisoAssistant.shared.present(
             panel: .automation(targetApplicationName: browserAutomationPermissionStatus.browserName)
         )
     }
@@ -337,8 +476,9 @@ final class CompanionManager: ObservableObject {
         hasCompletedOnboarding = true
 
         resetOnboardingPrompt()
+        isClickyHiddenBecauseMacCursorIsIdle = false
 
-        // Play Besaid theme at 60% volume, fade out after 1m 30s
+        // Play Besaid theme while the welcome animation and screen-aware prompt run.
         startOnboardingMusic()
 
         // Show the overlay for the first time — isFirstAppearance triggers
@@ -355,6 +495,7 @@ final class CompanionManager: ObservableObject {
 
         NotificationCenter.default.post(name: .clickyDismissPanel, object: nil)
         resetOnboardingPrompt()
+        isClickyHiddenBecauseMacCursorIsIdle = false
         startOnboardingMusic()
         // Tear down any existing overlays and recreate with isFirstAppearance = true
         overlayWindowManager.hasShownOverlayBefore = false
@@ -372,7 +513,7 @@ final class CompanionManager: ObservableObject {
     private func startOnboardingMusic() {
         stopOnboardingMusic()
         guard let musicURL = Bundle.main.url(forResource: "ff", withExtension: "mp3") else {
-            print("⚠️ Clicky: ff.mp3 not found in bundle")
+            print("Warning: Clicky: ff.mp3 not found in bundle")
             return
         }
 
@@ -382,16 +523,19 @@ final class CompanionManager: ObservableObject {
             player.play()
             self.onboardingMusicPlayer = player
 
-            // After 1m 30s, fade the music out over 3s
+            // Safety fallback in case onboarding prompt generation never completes.
             onboardingMusicFadeTimer = Timer.scheduledTimer(withTimeInterval: 90.0, repeats: false) { [weak self] _ in
                 self?.fadeOutOnboardingMusic()
             }
         } catch {
-            print("⚠️ Clicky: Failed to play onboarding music: \(error)")
+            print("Warning: Clicky: Failed to play onboarding music: \(error)")
         }
     }
 
     private func fadeOutOnboardingMusic() {
+        onboardingMusicFadeTimer?.invalidate()
+        onboardingMusicFadeTimer = nil
+
         guard let player = onboardingMusicPlayer else { return }
 
         let fadeSteps = 30
@@ -430,6 +574,7 @@ final class CompanionManager: ObservableObject {
         overlayWindowManager.hideOverlay()
         transientHideTask?.cancel()
         transientHideTask = nil
+        stopMacCursorIdleTracking()
         pendingKeyboardShortcutStartTask?.cancel()
         pendingKeyboardShortcutStartTask = nil
 
@@ -469,6 +614,9 @@ final class CompanionManager: ObservableObject {
         let micAuthStatus = AVCaptureDevice.authorizationStatus(for: .audio)
         hasMicrophonePermission = micAuthStatus == .authorized
 
+        let speechRecognitionAuthorizationStatus = SFSpeechRecognizer.authorizationStatus()
+        hasSpeechRecognitionPermission = speechRecognitionAuthorizationStatus == .authorized
+
         // Screen content permission is persisted — once the user has approved the
         // SCShareableContent picker, we don't need to re-check it.
         if !hasScreenContentPermission {
@@ -507,12 +655,13 @@ final class CompanionManager: ObservableObject {
                 // Verify the capture actually returned real content — a 0x0 or
                 // fully-empty image means the user denied the prompt.
                 let didCapture = image.width > 0 && image.height > 0
-                print("🔑 Screen content capture result — width: \(image.width), height: \(image.height), didCapture: \(didCapture)")
+                print("Screen content capture result — width: \(image.width), height: \(image.height), didCapture: \(didCapture)")
                 await MainActor.run {
                     isRequestingScreenContent = false
                     guard didCapture else { return }
                     hasScreenContentPermission = true
                     UserDefaults.standard.set(true, forKey: "hasScreenContentPermission")
+                    computerUseWindowContextController.refresh(screenContentGranted: hasScreenContentPermission)
 
                     // If onboarding was already completed, show the cursor overlay now
                     if isAgentRunning && hasCompletedOnboarding && allPermissionsGranted && !isOverlayVisible && isClickyCursorEnabled {
@@ -522,7 +671,7 @@ final class CompanionManager: ObservableObject {
                     }
                 }
             } catch {
-                print("⚠️ Screen content permission request failed: \(error)")
+                print("Warning: Screen content permission request failed: \(error)")
                 await MainActor.run { isRequestingScreenContent = false }
             }
         }
@@ -551,6 +700,53 @@ final class CompanionManager: ObservableObject {
                 self?.refreshAllPermissions()
             }
         }
+    }
+
+    private func startMacCursorIdleTrackingIfNeeded() {
+        macCursorIdleTrackingTimer?.invalidate()
+        macCursorIdleTrackingTimer = nil
+
+        guard isAgentRunning && shouldHideClickyWhenMacCursorIsIdle else {
+            isClickyHiddenBecauseMacCursorIsIdle = false
+            return
+        }
+
+        macCursorIdleTrackingTimer = Timer.scheduledTimer(withTimeInterval: Self.macCursorIdleTrackingIntervalSeconds, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.refreshClickyVisibilityForMacCursorIdle()
+            }
+        }
+    }
+
+    private func stopMacCursorIdleTracking() {
+        macCursorIdleTrackingTimer?.invalidate()
+        macCursorIdleTrackingTimer = nil
+        isClickyHiddenBecauseMacCursorIsIdle = false
+    }
+
+    private func refreshClickyVisibilityForMacCursorIdle() {
+        guard shouldHideClickyWhenMacCursorIsIdle && isAgentRunning else {
+            isClickyHiddenBecauseMacCursorIsIdle = false
+            return
+        }
+
+        let secondsSinceLastCursorMovement = Self.macCursorMovementEventTypes
+            .map { CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: $0) }
+            .min() ?? 0
+        let shouldHideBecauseCursorIsIdle = secondsSinceLastCursorMovement >= Self.macCursorIdleHideDelaySeconds
+            && canHideClickyForMacCursorIdle
+
+        guard isClickyHiddenBecauseMacCursorIsIdle != shouldHideBecauseCursorIsIdle else { return }
+        isClickyHiddenBecauseMacCursorIsIdle = shouldHideBecauseCursorIsIdle
+    }
+
+    private var canHideClickyForMacCursorIdle: Bool {
+        voiceState == .idle
+            && !(nativeSpeechSynthesizer?.isSpeaking ?? false)
+            && detectedElementScreenLocation == nil
+            && pendingKeyboardShortcutStartTask == nil
+            && !buddyDictationManager.isDictationInProgress
+            && !showOnboardingPrompt
     }
 
     private func bindAudioPowerLevel() {
@@ -616,9 +812,11 @@ final class CompanionManager: ObservableObject {
             // Cancel any pending transient hide so the overlay stays visible
             transientHideTask?.cancel()
             transientHideTask = nil
+            isClickyHiddenBecauseMacCursorIsIdle = false
 
-            // If the cursor is hidden, bring it back transiently for this interaction
-            if !isClickyCursorEnabled && !isOverlayVisible {
+            // If the cursor overlay is hidden, bring it up for this keyboard interaction.
+            // When Show Clicky is off, the transient-hide path will dismiss it after the response.
+            if !isOverlayVisible {
                 overlayWindowManager.hasShownOverlayBefore = true
                 overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
                 isOverlayVisible = true
@@ -642,22 +840,18 @@ final class CompanionManager: ObservableObject {
                     self.onboardingPromptText = ""
                 }
             }
-    
-
 
             pendingKeyboardShortcutStartTask?.cancel()
             pendingKeyboardShortcutStartTask = Task {
-                await buddyDictationManager.startPushToTalkFromKeyboardShortcut(
-                    currentDraftText: "",
-                    updateDraftText: { _ in
-                        // Partial transcripts are hidden (waveform-only UI)
-                    },
-                    submitDraftText: { [weak self] finalTranscript in
-                        self?.lastTranscript = finalTranscript
-                        print("🗣️ Companion received transcript: \(finalTranscript)")
-                        self?.sendTranscriptToCodexWithScreenshot(transcript: finalTranscript)
-                    }
-                )
+                await buddyDictationManager.startPushToTalkFromKeyboardShortcut { [weak self] finalTranscript in
+                    self?.lastTranscript = finalTranscript
+                    print("Companion received transcript: \(finalTranscript)")
+                    self?.sendTranscriptToCodexWithScreenshot(
+                        transcript: finalTranscript,
+                        source: .voiceTranscript,
+                        inputReceivedAt: Date()
+                    )
+                }
             }
         case .released:
             // Cancel the pending start task in case the user released the shortcut
@@ -710,15 +904,25 @@ final class CompanionManager: ObservableObject {
     """
 
     private static let backgroundActionPlannerSystemPrompt = """
-    you're clicky's background action planner. decide whether the user's message is asking clicky to quietly do a background computer action without asking a follow-up.
+    you're clicky's background computer-use planner. decide whether the user's message is asking clicky to quietly perform a safe background action without asking a follow-up.
 
     return json only. no markdown. no commentary.
 
     supported actions:
     - open_url_in_background_browser: opens a public http or https url in an already-running browser window without intentionally foregrounding the browser.
+    - press_ax_target: presses one listed accessibility target ref, like @e1.
+    - focus_ax_target: focuses one listed accessibility target ref.
+    - set_ax_text: replaces the text value of one listed accessibility target ref.
+    - scroll_ax_target: scrolls one listed accessibility target ref. use positive scrollY to scroll down, negative scrollY to scroll up.
+    - perform_ax_action: performs one safe listed accessibility action. axAction may be press, increment, decrement, confirm, cancel, show_menu, or pick.
+    - wait: waits briefly between actions when the next action needs the app to settle.
 
     rules:
-    - if the user clearly asks you to do something in the background, create actions. do not ask for confirmation.
+    - if the user clearly asks you to do something in the background or asks clicky to operate the current app, create actions. do not ask for confirmation.
+    - only use accessibility refs that appear in the provided current controlled window context.
+    - prefer set_ax_text for replacing text fields, press_ax_target for buttons/links/menu items, scroll_ax_target for scroll areas, and perform_ax_action only when a more specific action type does not fit.
+    - keep plans short: one to six actions unless the user explicitly asks for a multi-step operation.
+    - do not use background computer actions for destructive, irreversible, purchasing, sending, deleting, or security-sensitive operations. return an empty actions array for those.
     - if the user asks a question, asks for advice, needs explanation, needs screen-specific guidance, or the request is not clearly executable with the supported actions, return an empty actions array.
     - choose reusable web urls, not special clicky commands. for media, documents, search, or web content, choose a normal public url that best satisfies the request.
     - do not invent private or local urls.
@@ -738,14 +942,54 @@ final class CompanionManager: ObservableObject {
                 "items": [
                     "type": "object",
                     "additionalProperties": false,
-                    "required": ["type", "url"],
+                    "required": [
+                        "type",
+                        "url",
+                        "ref",
+                        "text",
+                        "scrollX",
+                        "scrollY",
+                        "steps",
+                        "axAction",
+                        "milliseconds"
+                    ],
                     "properties": [
                         "type": [
                             "type": "string",
-                            "enum": ["open_url_in_background_browser"]
+                            "enum": [
+                                "open_url_in_background_browser",
+                                "press_ax_target",
+                                "focus_ax_target",
+                                "set_ax_text",
+                                "scroll_ax_target",
+                                "perform_ax_action",
+                                "wait"
+                            ]
                         ],
                         "url": [
-                            "type": "string"
+                            "type": ["string", "null"]
+                        ],
+                        "ref": [
+                            "type": ["string", "null"]
+                        ],
+                        "text": [
+                            "type": ["string", "null"]
+                        ],
+                        "scrollX": [
+                            "type": ["integer", "null"]
+                        ],
+                        "scrollY": [
+                            "type": ["integer", "null"]
+                        ],
+                        "steps": [
+                            "type": ["integer", "null"]
+                        ],
+                        "axAction": [
+                            "type": ["string", "null"],
+                            "enum": ["press", "increment", "decrement", "confirm", "cancel", "show_menu", "pick", NSNull()]
+                        ],
+                        "milliseconds": [
+                            "type": ["integer", "null"]
                         ]
                     ]
                 ]
@@ -760,70 +1004,224 @@ final class CompanionManager: ObservableObject {
     /// the spinner/processing state until speech playback begins.
     /// Codex's response may include a [POINT:x,y:label] tag which triggers
     /// the buddy to fly to that element on screen.
-    private func sendTranscriptToCodexWithScreenshot(transcript: String) {
+    private func sendTranscriptToCodexWithScreenshot(
+        transcript: String,
+        source: CompanionResponseInputSource,
+        inputReceivedAt: Date
+    ) {
         currentResponseTask?.cancel()
         stopNativeSpeechPlayback()
+
+        let requestedModel = selectedModel.isEmpty ? "app-server-default" : selectedModel
+        let requestedReasoningEffort = selectedReasoningEffortForCodexRequest ?? "default"
+        let requestedServiceTier = selectedServiceTierForCodexRequest ?? "standard"
+        printResponseTiming(
+            source: source,
+            "submitted chars=\(transcript.count) model=\(requestedModel) effort=\(requestedReasoningEffort) serviceTier=\(requestedServiceTier)",
+            since: inputReceivedAt
+        )
 
         currentResponseTask = Task {
             // Stay in processing (spinner) state — no streaming text displayed
             voiceState = .processing
 
             do {
-                let didExecuteBackgroundAction = await executeBackgroundActionIfPlanned(for: transcript)
+                let didExecuteBackgroundAction = await executeBackgroundActionIfPlanned(
+                    for: transcript,
+                    source: source,
+                    inputReceivedAt: inputReceivedAt
+                )
                 if !didExecuteBackgroundAction {
-                    try await answerTranscriptWithScreenshot(transcript: transcript)
+                    try await answerTranscriptWithScreenshot(
+                        transcript: transcript,
+                        source: source,
+                        inputReceivedAt: inputReceivedAt
+                    )
                 }
             } catch is CancellationError {
                 // User spoke again — response was interrupted
+                printResponseTiming(source: source, "cancelled", since: inputReceivedAt)
             } catch {
-                print("⚠️ Companion response error: \(error)")
+                print("Warning: Companion response error after \(Self.formattedResponseLogDuration(Date().timeIntervalSince(inputReceivedAt))): \(error)")
                 speakNativeText("I hit a snag while answering. Try that again.")
             }
 
             if !Task.isCancelled {
+                printResponseTiming(source: source, "response task finished", since: inputReceivedAt)
                 voiceState = .idle
                 scheduleTransientHideIfNeeded()
             }
         }
     }
 
-    private func executeBackgroundActionIfPlanned(for transcript: String) async -> Bool {
+    private func executeBackgroundActionIfPlanned(
+        for transcript: String,
+        source: CompanionResponseInputSource,
+        inputReceivedAt: Date
+    ) async -> Bool {
+        let backgroundContextCaptureStartedAt = Date()
+        let computerUseSnapshot = CompanionBackgroundComputerUseController.snapshotForCurrentVisibleWindow()
+        printResponseTiming(
+            source: source,
+            "background context ready hasWindow=\(computerUseSnapshot != nil) capture=\(Self.formattedResponseLogDuration(Date().timeIntervalSince(backgroundContextCaptureStartedAt)))",
+            since: inputReceivedAt
+        )
+        ClickyMessageLogStore.shared.append(
+            lane: "computer-use",
+            direction: "incoming",
+            event: "background_action.context_ready",
+            fields: [
+                "source": source.logName,
+                "hasWindow": "\(computerUseSnapshot != nil)",
+                "appName": computerUseSnapshot?.appName ?? "none",
+                "windowTitle": computerUseSnapshot?.windowTitle ?? "none",
+                "targetCount": "\(computerUseSnapshot?.targets.count ?? 0)"
+            ]
+        )
+
         do {
+            let plannerStartedAt = Date()
+            printResponseTiming(source: source, "background planner started", since: inputReceivedAt)
+
             let (responseText, _) = try await codexAppServerClient.analyzeTextStreaming(
                 developerInstructions: Self.backgroundActionPlannerSystemPrompt,
-                userPrompt: transcript,
+                userPrompt: Self.backgroundActionPlannerUserPrompt(
+                    transcript: transcript,
+                    computerUseSnapshot: computerUseSnapshot
+                ),
                 model: selectedModel,
+                reasoningEffort: selectedReasoningEffortForCodexRequest,
+                serviceTier: selectedServiceTierForCodexRequest,
                 outputSchema: Self.backgroundActionOutputSchema,
+                debugLogLabel: "\(source.logName) background planner",
                 onTextChunk: { _ in }
+            )
+            printResponseTiming(
+                source: source,
+                "background planner finished turn=\(Self.formattedResponseLogDuration(Date().timeIntervalSince(plannerStartedAt))) responseChars=\(responseText.count)",
+                since: inputReceivedAt
             )
 
             let plan = try Self.decodeBackgroundActionPlan(from: responseText)
             guard plan.hasExecutableActions else {
+                printResponseTiming(source: source, "background planner found no action", since: inputReceivedAt)
+                ClickyMessageLogStore.shared.append(
+                    lane: "computer-use",
+                    direction: "event",
+                    event: "background_action.no_action",
+                    fields: [
+                        "source": source.logName,
+                        "responseCharacterCount": "\(responseText.count)"
+                    ]
+                )
                 return false
             }
 
+            ClickyMessageLogStore.shared.append(
+                lane: "computer-use",
+                direction: "outgoing",
+                event: "background_action.plan_ready",
+                fields: [
+                    "source": source.logName,
+                    "actionCount": "\(plan.actions.count)",
+                    "spokenTextCharacterCount": "\(plan.spokenText.count)"
+                ]
+            )
+            printResponseTiming(source: source, "executing background actions count=\(plan.actions.count)", since: inputReceivedAt)
             guard !Task.isCancelled else { return true }
             do {
-                let result = try await CompanionBackgroundActionExecutor.execute(plan: plan)
+                let result = try await CompanionBackgroundActionExecutor.execute(
+                    plan: plan,
+                    computerUseSnapshot: computerUseSnapshot
+                )
+                ClickyMessageLogStore.shared.append(
+                    lane: "computer-use",
+                    direction: "event",
+                    event: "background_action.executed",
+                    fields: [
+                        "source": source.logName,
+                        "actionCount": "\(plan.actions.count)",
+                        "spokenTextCharacterCount": "\(result.spokenText.count)"
+                    ]
+                )
+                printResponseTiming(source: source, "background actions finished", since: inputReceivedAt)
                 if !result.spokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    printResponseTiming(source: source, "speech starting from background action", since: inputReceivedAt)
                     speakNativeText(result.spokenText)
                 }
             } catch {
-                print("⚠️ Background action execution failed: \(error)")
+                print("Warning: Background action execution failed: \(error)")
+                ClickyMessageLogStore.shared.append(
+                    lane: "computer-use",
+                    direction: "error",
+                    event: "background_action.execution_failed",
+                    fields: [
+                        "source": source.logName,
+                        "error": error.localizedDescription
+                    ]
+                )
                 speakNativeText(error.localizedDescription)
             }
             return true
         } catch is CancellationError {
+            printResponseTiming(source: source, "background planner cancelled", since: inputReceivedAt)
             return true
         } catch {
-            print("⚠️ Background action planner skipped: \(error)")
+            print("Warning: Background action planner skipped after \(Self.formattedResponseLogDuration(Date().timeIntervalSince(inputReceivedAt))): \(error)")
+            ClickyMessageLogStore.shared.append(
+                lane: "computer-use",
+                direction: "error",
+                event: "background_action.planner_skipped",
+                fields: [
+                    "source": source.logName,
+                    "error": error.localizedDescription
+                ]
+            )
             return false
         }
     }
 
-    private func answerTranscriptWithScreenshot(transcript: String) async throws {
+    private static func backgroundActionPlannerUserPrompt(
+        transcript: String,
+        computerUseSnapshot: CompanionBackgroundComputerUseSnapshot?
+    ) -> String {
+        let computerUseContext = computerUseSnapshot?.plannerContext ?? "current controlled window:\nnone"
+        return """
+        user message:
+        \(transcript)
+
+        \(computerUseContext)
+        """
+    }
+
+    private static func companionVoiceUserPrompt(transcript: String, focusedWindowContext: String) -> String {
+        """
+        current focused app context:
+        \(focusedWindowContext)
+
+        user message:
+        \(transcript)
+        """
+    }
+
+    private func answerTranscriptWithScreenshot(
+        transcript: String,
+        source: CompanionResponseInputSource,
+        inputReceivedAt: Date
+    ) async throws {
         // Capture all connected screens so the AI has full context
+        let screenshotCaptureStartedAt = Date()
+        printResponseTiming(source: source, "screenshot capture started", since: inputReceivedAt)
         let screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+        let screenshotCaptureDuration = Date().timeIntervalSince(screenshotCaptureStartedAt)
+        let totalScreenshotBytes = screenCaptures.reduce(0) { partialByteCount, screenCapture in
+            partialByteCount + screenCapture.imageData.count
+        }
+        printResponseTiming(
+            source: source,
+            "screenshot capture finished screens=\(screenCaptures.count) bytes=\(totalScreenshotBytes) capture=\(Self.formattedResponseLogDuration(screenshotCaptureDuration))",
+            since: inputReceivedAt
+        )
 
         guard !Task.isCancelled else { return }
 
@@ -834,15 +1232,52 @@ final class CompanionManager: ObservableObject {
             let dimensionInfo = " (image dimensions: \(capture.screenshotWidthInPixels)x\(capture.screenshotHeightInPixels) pixels)"
             return (data: capture.imageData, label: capture.label + dimensionInfo)
         }
+        let focusedWindowContext = computerUseWindowContextController.focusedWindowPromptContext()
+        let userPromptWithFocusedWindowContext = Self.companionVoiceUserPrompt(
+            transcript: transcript,
+            focusedWindowContext: focusedWindowContext
+        )
 
-        let (fullResponseText, _) = try await codexAppServerClient.analyzeImageStreaming(
+        let answerTurnStartedAt = Date()
+        ClickyMessageLogStore.shared.append(
+            lane: "agent",
+            direction: "outgoing",
+            event: "voice_answer.turn_started",
+            fields: [
+                "source": source.logName,
+                "imageCount": "\(labeledImages.count)",
+                "model": selectedModel.isEmpty ? "default" : selectedModel,
+                "focusedWindowContext": focusedWindowContext
+            ]
+        )
+        printResponseTiming(source: source, "answer turn started images=\(labeledImages.count)", since: inputReceivedAt)
+        let (fullResponseText, answerTurnDuration) = try await codexAppServerClient.analyzeImageStreaming(
             images: labeledImages,
             developerInstructions: Self.companionVoiceResponseSystemPrompt,
-            userPrompt: transcript,
+            userPrompt: userPromptWithFocusedWindowContext,
             model: selectedModel,
+            reasoningEffort: selectedReasoningEffortForCodexRequest,
+            serviceTier: selectedServiceTierForCodexRequest,
+            debugLogLabel: "\(source.logName) answer",
             onTextChunk: { _ in
                 // No streaming text display — spinner stays until speech plays
             }
+        )
+        ClickyMessageLogStore.shared.append(
+            lane: "agent",
+            direction: "incoming",
+            event: "voice_answer.turn_finished",
+            fields: [
+                "source": source.logName,
+                "clientTurnSeconds": Self.formattedResponseLogDuration(answerTurnDuration),
+                "wallSeconds": Self.formattedResponseLogDuration(Date().timeIntervalSince(answerTurnStartedAt)),
+                "responseCharacterCount": "\(fullResponseText.count)"
+            ]
+        )
+        printResponseTiming(
+            source: source,
+            "answer turn finished clientTurn=\(Self.formattedResponseLogDuration(answerTurnDuration)) wall=\(Self.formattedResponseLogDuration(Date().timeIntervalSince(answerTurnStartedAt))) responseChars=\(fullResponseText.count)",
+            since: inputReceivedAt
         )
 
         guard !Task.isCancelled else { return }
@@ -900,12 +1335,13 @@ final class CompanionManager: ObservableObject {
 
             detectedElementScreenLocation = globalLocation
             detectedElementDisplayFrame = displayFrame
-            print("🎯 Element pointing: (\(Int(pointCoordinate.x)), \(Int(pointCoordinate.y))) → \"\(parseResult.elementLabel ?? "element")\"")
+            print("Element pointing: (\(Int(pointCoordinate.x)), \(Int(pointCoordinate.y))) → \"\(parseResult.elementLabel ?? "element")\"")
         } else {
-            print("🎯 Element pointing: \(parseResult.elementLabel ?? "no element")")
+            print("Element pointing: \(parseResult.elementLabel ?? "no element")")
         }
 
         if !spokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            printResponseTiming(source: source, "speech starting chars=\(spokenText.count)", since: inputReceivedAt)
             speakNativeText(spokenText)
         }
     }
@@ -1039,7 +1475,7 @@ final class CompanionManager: ObservableObject {
     - do not mention screenshots, images, video, onboarding, or codex.
     - do not quote private text or long visible content.
     - if the screen is unclear or sensitive, keep it generic.
-    - end by telling the user to press control + option to talk.
+    - end by telling the user to press \(BuddyPushToTalkShortcut.pushToTalkDisplayText) to talk.
     """
 
     func startOnboardingScreenAwarePrompt() {
@@ -1061,6 +1497,8 @@ final class CompanionManager: ObservableObject {
                     developerInstructions: Self.onboardingScreenAwarePromptSystemPrompt,
                     userPrompt: "write a short, screen-aware welcome suggestion for me",
                     model: selectedModel,
+                    reasoningEffort: selectedReasoningEffortForCodexRequest,
+                    serviceTier: selectedServiceTierForCodexRequest,
                     onTextChunk: { _ in }
                 )
 
@@ -1070,13 +1508,13 @@ final class CompanionManager: ObservableObject {
                     : trimmedResponseText
                 startOnboardingPromptStream(message: promptMessage)
             } catch {
-                print("⚠️ Onboarding prompt error: \(error)")
+                print("Warning: Onboarding prompt error: \(error)")
                 startOnboardingPromptStream(message: Self.fallbackOnboardingPromptMessage)
             }
         }
     }
 
-    private static let fallbackOnboardingPromptMessage = "ask me what's on your screen, and i'll help you figure out what to do next. press control + option to talk"
+    private static let fallbackOnboardingPromptMessage = "ask me what's on your screen, and i'll help you figure out what to do next. press \(BuddyPushToTalkShortcut.pushToTalkDisplayText) to talk"
 
     private func resetOnboardingPrompt() {
         onboardingPromptStreamTimer?.invalidate()
@@ -1101,6 +1539,7 @@ final class CompanionManager: ObservableObject {
             guard currentIndex < message.count else {
                 timer.invalidate()
                 self.onboardingPromptStreamTimer = nil
+                self.fadeOutOnboardingMusic()
                 DispatchQueue.main.asyncAfter(deadline: .now() + 10.0) {
                     guard self.showOnboardingPrompt else { return }
                     withAnimation(.easeOut(duration: 0.3)) {

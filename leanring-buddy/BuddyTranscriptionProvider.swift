@@ -36,7 +36,7 @@ enum BuddyTranscriptionProviderFactory {
 
     static func makeDefaultProvider() -> any BuddyTranscriptionProvider {
         let provider = resolveProvider()
-        print("🎙️ Transcription: using \(provider.displayName)")
+        print("Transcription: using \(provider.displayName)")
         return provider
     }
 
