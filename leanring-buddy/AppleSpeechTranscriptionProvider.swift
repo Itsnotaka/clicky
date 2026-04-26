@@ -2,7 +2,7 @@
 //  AppleSpeechTranscriptionProvider.swift
 //  leanring-buddy
 //
-//  Local fallback transcription provider backed by Apple's Speech framework.
+//  Speech-to-text provider backed by Apple's Speech framework.
 //
 
 import AVFoundation

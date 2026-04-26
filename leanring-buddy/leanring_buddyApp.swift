@@ -4,7 +4,7 @@
 //
 //  Menu bar-only companion app. No dock icon, no main window — just an
 //  always-available status item in the macOS menu bar. Clicking the icon
-//  opens a floating panel with companion voice controls.
+//  opens a compact native menu with companion voice controls.
 //
 
 import ServiceManagement
@@ -16,7 +16,7 @@ struct leanring_buddyApp: App {
     @NSApplicationDelegateAdaptor(CompanionAppDelegate.self) var appDelegate
 
     var body: some Scene {
-        // The app lives entirely in the menu bar panel managed by the AppDelegate.
+        // The app lives entirely in the menu bar item managed by the AppDelegate.
         // This empty Settings scene satisfies SwiftUI's requirement for at least
         // one scene but is never shown (LSUIElement=true removes the app menu).
         Settings {
@@ -25,7 +25,7 @@ struct leanring_buddyApp: App {
     }
 }
 
-/// Manages the companion lifecycle: creates the menu bar panel and starts
+/// Manages the companion lifecycle: creates the menu bar item and starts
 /// the companion voice pipeline on launch.
 @MainActor
 final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
@@ -39,15 +39,12 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
 
         UserDefaults.standard.register(defaults: ["NSInitialToolTipDelay": 0])
 
-        ClickyAnalytics.configure()
-        ClickyAnalytics.trackAppOpened()
-
         menuBarPanelManager = MenuBarPanelManager(companionManager: companionManager)
         companionManager.start()
-        // Auto-open the panel if the user still needs to do something:
+        // Auto-open the menu if the user still needs to do something:
         // either they haven't onboarded yet, or permissions were revoked.
         if !companionManager.hasCompletedOnboarding || !companionManager.allPermissionsGranted {
-            menuBarPanelManager?.showPanelOnLaunch()
+            menuBarPanelManager?.showMenuOnLaunch()
         }
         registerAsLoginItemIfNeeded()
         // startSparkleUpdater()

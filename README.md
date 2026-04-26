@@ -1,152 +1,82 @@
-# Hi, this is Clicky.
-It's an AI teacher that lives as a buddy next to your cursor. It can see your screen, talk to you, and even point at stuff. Kinda like having a real teacher next to you.
+# Clicky
 
-Download it [here](https://www.clicky.so/) for free.
+Clicky is a macOS menu bar app that lives next to your cursor. It listens with push-to-talk, sees your screen, asks Codex for help, speaks the answer with native macOS speech, and can point at UI elements with an orange cursor overlay.
 
-Here's the [original tweet](https://x.com/FarzaTV/status/2041314633978659092) that kinda blew up for a demo for more context.
-
-![Clicky — an ai buddy that lives on your mac](clicky-demo.gif)
-
-This is the open-source version of Clicky for those that want to hack on it, build their own features, or just see how it works under the hood.
-
-## Get started with Claude Code
-
-The fastest way to get this running is with [Claude Code](https://docs.anthropic.com/en/docs/claude-code).
-
-Once you get Claude running, paste this:
-
-```
-Hi Claude.
-
-Clone https://github.com/farzaa/clicky.git into my current directory.
-
-Then read the CLAUDE.md. I want to get Clicky running locally on my Mac.
-
-Help me set up everything — the Cloudflare Worker with my own API keys, the proxy URLs, and getting it building in Xcode. Walk me through it.
-```
-
-That's it. It'll clone the repo, read the docs, and walk you through the whole setup. Once you're running you can just keep talking to it — build features, fix bugs, whatever. Go crazy.
-
-## Manual setup
-
-If you want to do it yourself, here's the deal.
-
-### Prerequisites
-
-- macOS 14.2+ (for ScreenCaptureKit)
-- Xcode 15+
-- Node.js 18+ (for the Cloudflare Worker)
-- A [Cloudflare](https://cloudflare.com) account (free tier works)
-- API keys for: [Anthropic](https://console.anthropic.com), [AssemblyAI](https://www.assemblyai.com), [ElevenLabs](https://elevenlabs.io)
-
-### 1. Set up the Cloudflare Worker
-
-The Worker is a tiny proxy that holds your API keys. The app talks to the Worker, the Worker talks to the APIs. This way your keys never ship in the app binary.
-
-```bash
-cd worker
-npm install
-```
-
-Now add your secrets. Wrangler will prompt you to paste each one:
-
-```bash
-npx wrangler secret put ANTHROPIC_API_KEY
-npx wrangler secret put ASSEMBLYAI_API_KEY
-npx wrangler secret put ELEVENLABS_API_KEY
-```
-
-For the ElevenLabs voice ID, open `wrangler.toml` and set it there (it's not sensitive):
-
-```toml
-[vars]
-ELEVENLABS_VOICE_ID = "your-voice-id-here"
-```
-
-Deploy it:
-
-```bash
-npx wrangler deploy
-```
-
-It'll give you a URL like `https://your-worker-name.your-subdomain.workers.dev`. Copy that.
-
-### 2. Run the Worker locally (for development)
-
-If you want to test changes to the Worker without deploying:
-
-```bash
-cd worker
-npx wrangler dev
-```
-
-This starts a local server (usually `http://localhost:8787`) that behaves exactly like the deployed Worker. You'll need to create a `.dev.vars` file in the `worker/` directory with your keys:
-
-```
-ANTHROPIC_API_KEY=sk-ant-...
-ASSEMBLYAI_API_KEY=...
-ELEVENLABS_API_KEY=...
-ELEVENLABS_VOICE_ID=...
-```
-
-Then update the proxy URLs in the Swift code to point to `http://localhost:8787` instead of the deployed Worker URL while developing. Grep for `clicky-proxy` to find them all.
-
-### 3. Update the proxy URLs in the app
-
-The app has the Worker URL hardcoded in a few places. Search for `your-worker-name.your-subdomain.workers.dev` and replace it with your Worker URL:
-
-```bash
-grep -r "clicky-proxy" leanring-buddy/
-```
-
-You'll find it in:
-- `CompanionManager.swift` — Claude chat + ElevenLabs TTS
-- `AssemblyAIStreamingTranscriptionProvider.swift` — AssemblyAI token endpoint
-
-### 4. Open in Xcode and run
-
-```bash
-open leanring-buddy.xcodeproj
-```
-
-In Xcode:
-1. Select the `leanring-buddy` scheme (yes, the typo is intentional, long story)
-2. Set your signing team under Signing & Capabilities
-3. Hit **Cmd + R** to build and run
-
-The app will appear in your menu bar (not the dock). Click the icon to open the panel, grant the permissions it asks for, and you're good.
-
-### Permissions the app needs
-
-- **Microphone** — for push-to-talk voice capture
-- **Accessibility** — for the global keyboard shortcut (Control + Option)
-- **Screen Recording** — for taking screenshots when you use the hotkey
-- **Screen Content** — for ScreenCaptureKit access
+This repo is the open-source app code for hacking on Clicky locally.
 
 ## Architecture
 
-If you want the full technical breakdown, read `CLAUDE.md`. But here's the short version:
+Clicky is an `LSUIElement` app. It has no dock icon and no main window. The menu bar status item opens a native `NSMenu`; the cursor overlay is a transparent `NSPanel`.
 
-**Menu bar app** (no dock icon) with two `NSPanel` windows — one for the control panel dropdown, one for the full-screen transparent cursor overlay. Push-to-talk streams audio over a websocket to AssemblyAI, sends the transcript + screenshot to Claude via streaming SSE, and plays the response through ElevenLabs TTS. Claude can embed `[POINT:x,y:label:screenN]` tags in its responses to make the cursor fly to specific UI elements across multiple monitors. All three APIs are proxied through a Cloudflare Worker.
+Push-to-talk is the primary flow:
 
-## Project structure
+1. Hold `ctrl+option`.
+2. The app records microphone audio.
+3. Apple Speech transcribes the audio.
+4. The transcript and screenshot go to Codex app-server.
+5. The response is spoken with native macOS speech.
+6. `[POINT:x,y:label:screenN]` response tags move the cursor overlay to a screen element.
 
+Codex is the only AI backend. The app does not use AssemblyAI, Claude, ElevenLabs, or a chat/speech proxy.
+
+## Requirements
+
+- macOS 14.2+ for ScreenCaptureKit.
+- Xcode 15+.
+- [Codex CLI](https://github.com/openai/codex) signed in with ChatGPT.
+
+## Development
+
+```bash
+open leanring-buddy.xcodeproj
+xcrun swiftc -parse $(rg --files -g '*.swift' leanring-buddy)
+git diff --check
 ```
-leanring-buddy/          # Swift source (yes, the typo stays)
-  CompanionManager.swift    # Central state machine
-  CompanionPanelView.swift  # Menu bar panel UI
-  ClaudeAPI.swift           # Claude streaming client
-  ElevenLabsTTSClient.swift # Text-to-speech playback
-  OverlayWindow.swift       # Blue cursor overlay
-  AssemblyAI*.swift         # Real-time transcription
-  BuddyDictation*.swift     # Push-to-talk pipeline
-worker/                  # Cloudflare Worker proxy
-  src/index.ts              # Three routes: /chat, /tts, /transcribe-token
-CLAUDE.md                # Full architecture doc (agents read this)
-```
+
+Run the app from Xcode with the `leanring-buddy` scheme. Do not run `xcodebuild`; it can invalidate local TCC permissions.
+
+## Permissions
+
+Clicky requests these macOS permissions:
+
+- Microphone - push-to-talk voice capture.
+- Accessibility - global keyboard shortcut and target-app actions.
+- Screen Recording - screenshot capture.
+- Screen Content - ScreenCaptureKit access.
+- Speech Recognition - Apple Speech dictation.
+
+## Project Map
+
+| Path | Purpose |
+|------|---------|
+| `leanring-buddy/` | Main macOS app target. Read `leanring-buddy/AGENTS.md` before editing Swift. |
+| `leanring-buddy.xcodeproj/` | Xcode project. Keep the `leanring-buddy` scheme name. |
+| `leanring-buddyTests/` | Generated test target. Do not add or run tests unless asked. |
+| `leanring-buddyUITests/` | Generated UI test target. Do not add or run tests unless asked. |
+| `scripts/` | Build/release helper scripts. |
+| `worker/` | Legacy Worker package. Not used for AI, transcription, or speech. |
+| `AGENTS.md` | Repo-wide rules for agents and humans. |
+| `CLAUDE.md` | Older architecture notes; prefer `AGENTS.md` for current rules. |
+
+## App Source Map
+
+| File | Purpose |
+|------|---------|
+| `leanring-buddy/leanring_buddyApp.swift` | App entry point and lifecycle wiring. |
+| `leanring-buddy/CompanionManager.swift` | Main voice-mode state machine. |
+| `leanring-buddy/MenuBarPanelManager.swift` | Native menu bar status item and menu. |
+| `leanring-buddy/BuddyDictationManager.swift` | Push-to-talk recording and transcript finalization. |
+| `leanring-buddy/AppleSpeechTranscriptionProvider.swift` | Apple Speech push-to-talk transcription. |
+| `leanring-buddy/CodexAppServerClient.swift` | Codex app-server process and JSON-RPC bridge. |
+| `leanring-buddy/CompanionScreenCaptureUtility.swift` | Screenshot and focused-window context. |
+| `leanring-buddy/OverlayWindow.swift` | Transparent orange cursor overlay panel. |
+| `leanring-buddy/CompanionResponseOverlay.swift` | SwiftUI overlay content. |
+| `leanring-buddy/GlobalPushToTalkShortcutMonitor.swift` | Global `ctrl+option` shortcut monitor. |
 
 ## Contributing
 
-PRs welcome. If you're using Claude Code, it already knows the codebase — just tell it what you want to build and point it at `CLAUDE.md`.
+Keep changes small and direct. Read `AGENTS.md` and the nearest nested `AGENTS.md` before editing. Do not commit unless explicitly asked.
 
-Got feedback? DM me on X [@farzatv](https://x.com/farzatv).
+## License
+
+MIT. See `LICENSE`.

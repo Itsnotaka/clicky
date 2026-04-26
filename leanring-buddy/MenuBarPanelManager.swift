@@ -2,63 +2,43 @@
 //  MenuBarPanelManager.swift
 //  leanring-buddy
 //
-//  Manages the NSStatusItem (menu bar icon) and a custom borderless NSPanel
-//  that drops down below it when clicked. The panel hosts a SwiftUI view
-//  (CompanionPanelView) via NSHostingView. Uses the same NSPanel pattern as
-//  FloatingSessionButton and GlobalPushToTalkOverlay for consistency.
-//
-//  The panel is non-activating so it does not steal focus from the user's
-//  current app, and auto-dismisses when the user clicks outside.
+//  Manages the NSStatusItem and its compact native NSMenu.
 //
 
 import AppKit
-import SwiftUI
+import AVFoundation
 
 extension Notification.Name {
     static let clickyDismissPanel = Notification.Name("clickyDismissPanel")
 }
 
-/// Custom NSPanel subclass that can become the key window even with
-/// .nonactivatingPanel style, allowing text fields to receive focus.
-private class KeyablePanel: NSPanel {
-    override var canBecomeKey: Bool { true }
-}
-
 @MainActor
 final class MenuBarPanelManager: NSObject {
     private var statusItem: NSStatusItem?
-    private var panel: NSPanel?
-    private var clickOutsideMonitor: Any?
-    private var dismissPanelObserver: NSObjectProtocol?
+    private var statusMenu: NSMenu?
+    private var dismissMenuObserver: NSObjectProtocol?
 
     private let companionManager: CompanionManager
-    private let panelWidth: CGFloat = 320
-    private let panelHeight: CGFloat = 380
 
     init(companionManager: CompanionManager) {
         self.companionManager = companionManager
         super.init()
         createStatusItem()
 
-        dismissPanelObserver = NotificationCenter.default.addObserver(
+        dismissMenuObserver = NotificationCenter.default.addObserver(
             forName: .clickyDismissPanel,
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.hidePanel()
+            self?.statusMenu?.cancelTracking()
         }
     }
 
     deinit {
-        if let monitor = clickOutsideMonitor {
-            NSEvent.removeMonitor(monitor)
-        }
-        if let observer = dismissPanelObserver {
-            NotificationCenter.default.removeObserver(observer)
+        if let dismissMenuObserver {
+            NotificationCenter.default.removeObserver(dismissMenuObserver)
         }
     }
-
-    // MARK: - Status Item
 
     private func createStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -71,27 +51,30 @@ final class MenuBarPanelManager: NSObject {
         button.target = self
     }
 
-    /// Draws the clicky triangle as a menu bar icon. Uses the same shape
-    /// and rotation as the in-app cursor so the menu bar icon matches.
     private func makeClickyMenuBarIcon() -> NSImage {
         let iconSize: CGFloat = 18
         let image = NSImage(size: NSSize(width: iconSize, height: iconSize))
         image.lockFocus()
 
         let triangleSize = iconSize * 0.7
-        let cx = iconSize * 0.50
-        let cy = iconSize * 0.50
+        let centerX = iconSize * 0.50
+        let centerY = iconSize * 0.50
         let height = triangleSize * sqrt(3.0) / 2.0
 
-        let top = CGPoint(x: cx, y: cy + height / 1.5)
-        let bottomLeft = CGPoint(x: cx - triangleSize / 2, y: cy - height / 3)
-        let bottomRight = CGPoint(x: cx + triangleSize / 2, y: cy - height / 3)
+        let top = CGPoint(x: centerX, y: centerY + height / 1.5)
+        let bottomLeft = CGPoint(x: centerX - triangleSize / 2, y: centerY - height / 3)
+        let bottomRight = CGPoint(x: centerX + triangleSize / 2, y: centerY - height / 3)
 
         let angle = 35.0 * .pi / 180.0
         func rotate(_ point: CGPoint) -> CGPoint {
-            let dx = point.x - cx, dy = point.y - cy
-            let cosA = CGFloat(cos(angle)), sinA = CGFloat(sin(angle))
-            return CGPoint(x: cx + cosA * dx - sinA * dy, y: cy + sinA * dx + cosA * dy)
+            let deltaX = point.x - centerX
+            let deltaY = point.y - centerY
+            let cosAngle = CGFloat(cos(angle))
+            let sinAngle = CGFloat(sin(angle))
+            return CGPoint(
+                x: centerX + cosAngle * deltaX - sinAngle * deltaY,
+                y: centerY + sinAngle * deltaX + cosAngle * deltaY
+            )
         }
 
         let path = NSBezierPath()
@@ -107,137 +90,304 @@ final class MenuBarPanelManager: NSObject {
         return image
     }
 
-    /// Opens the panel automatically on app launch so the user sees
-    /// permissions and the start button right away.
-    func showPanelOnLaunch() {
-        // Small delay so the status item has time to appear in the menu bar
+    func showMenuOnLaunch() {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-            self.showPanel()
+            self.showNativeStatusMenu()
         }
     }
 
     @objc private func statusItemClicked() {
-        if let panel, panel.isVisible {
-            hidePanel()
+        showNativeStatusMenu()
+    }
+
+    private func showNativeStatusMenu() {
+        guard let button = statusItem?.button else { return }
+
+        let menu = createNativeStatusMenu()
+        statusMenu = menu
+        statusItem?.menu = menu
+        button.performClick(nil)
+    }
+
+    private func createNativeStatusMenu() -> NSMenu {
+        companionManager.refreshAllPermissions()
+
+        let menu = NSMenu()
+        menu.delegate = self
+        menu.autoenablesItems = false
+
+        addHeaderItems(to: menu)
+        menu.addItem(.separator())
+        addCodexItems(to: menu)
+        menu.addItem(.separator())
+        addPermissionItems(to: menu)
+        menu.addItem(.separator())
+        addLifecycleItems(to: menu)
+
+        return menu
+    }
+
+    private func addHeaderItems(to menu: NSMenu) {
+        let statusItem = NSMenuItem(title: statusTitle, action: nil, keyEquivalent: "")
+        statusItem.isEnabled = false
+        menu.addItem(statusItem)
+
+        let shortcutItem = NSMenuItem(
+            title: "Hold \(BuddyPushToTalkShortcut.pushToTalkDisplayText) to talk",
+            action: nil,
+            keyEquivalent: ""
+        )
+        shortcutItem.isEnabled = false
+        menu.addItem(shortcutItem)
+
+        let showClickyItem = NSMenuItem(
+            title: "Show Clicky",
+            action: #selector(showClickyMenuItemSelected),
+            keyEquivalent: ""
+        )
+        showClickyItem.target = self
+        showClickyItem.state = companionManager.isClickyCursorEnabled ? .on : .off
+        showClickyItem.isEnabled = true
+        menu.addItem(showClickyItem)
+    }
+
+    private var statusTitle: String {
+        if !companionManager.hasCompletedOnboarding || !companionManager.allPermissionsGranted {
+            return "Clicky: Setup"
+        }
+
+        if !companionManager.isOverlayVisible {
+            return "Clicky: Ready"
+        }
+
+        switch companionManager.voiceState {
+        case .idle:
+            return "Clicky: Ready"
+        case .listening:
+            return "Clicky: Listening"
+        case .processing:
+            return "Clicky: Thinking"
+        case .responding:
+            return "Clicky: Responding"
+        }
+    }
+
+    private func addCodexItems(to menu: NSMenu) {
+        switch companionManager.codexConnectionState {
+        case .checking:
+            let item = NSMenuItem(title: "Codex: Checking", action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            menu.addItem(item)
+        case .needsSignIn:
+            let item = NSMenuItem(title: "Sign In to Codex", action: #selector(signInToCodexMenuItemSelected), keyEquivalent: "")
+            item.target = self
+            item.isEnabled = true
+            menu.addItem(item)
+        case .ready:
+            let item = NSMenuItem(title: "Codex: Ready", action: #selector(refreshCodexMenuItemSelected), keyEquivalent: "")
+            item.target = self
+            item.isEnabled = true
+            menu.addItem(item)
+        case .unavailable(let message):
+            let item = NSMenuItem(title: "Codex: \(message)", action: #selector(refreshCodexMenuItemSelected), keyEquivalent: "")
+            item.target = self
+            item.isEnabled = true
+            menu.addItem(item)
+        }
+
+        let modelItem = NSMenuItem(title: "Model: \(companionManager.selectedModelDisplayName)", action: nil, keyEquivalent: "")
+        let modelMenu = NSMenu()
+        if companionManager.availableModels.isEmpty {
+            let emptyItem = NSMenuItem(title: "Refresh Codex to load models", action: #selector(refreshCodexMenuItemSelected), keyEquivalent: "")
+            emptyItem.target = self
+            emptyItem.isEnabled = true
+            modelMenu.addItem(emptyItem)
         } else {
-            showPanel()
-        }
-    }
-
-    // MARK: - Panel Lifecycle
-
-    private func showPanel() {
-        if panel == nil {
-            createPanel()
-        }
-
-        positionPanelBelowStatusItem()
-
-        panel?.makeKeyAndOrderFront(nil)
-        panel?.orderFrontRegardless()
-        installClickOutsideMonitor()
-    }
-
-    private func hidePanel() {
-        panel?.orderOut(nil)
-        removeClickOutsideMonitor()
-    }
-
-    private func createPanel() {
-        let companionPanelView = CompanionPanelView(companionManager: companionManager)
-            .frame(width: panelWidth)
-
-        let hostingView = NSHostingView(rootView: companionPanelView)
-        hostingView.frame = NSRect(x: 0, y: 0, width: panelWidth, height: panelHeight)
-        hostingView.wantsLayer = true
-        hostingView.layer?.backgroundColor = .clear
-
-        let menuBarPanel = KeyablePanel(
-            contentRect: NSRect(x: 0, y: 0, width: panelWidth, height: panelHeight),
-            styleMask: [.borderless, .nonactivatingPanel],
-            backing: .buffered,
-            defer: false
-        )
-
-        menuBarPanel.isFloatingPanel = true
-        menuBarPanel.level = .floating
-        menuBarPanel.isOpaque = false
-        menuBarPanel.backgroundColor = .clear
-        menuBarPanel.hasShadow = false
-        menuBarPanel.hidesOnDeactivate = false
-        menuBarPanel.isExcludedFromWindowsMenu = true
-        menuBarPanel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        menuBarPanel.isMovableByWindowBackground = false
-        menuBarPanel.titleVisibility = .hidden
-        menuBarPanel.titlebarAppearsTransparent = true
-
-        menuBarPanel.contentView = hostingView
-        panel = menuBarPanel
-    }
-
-    private func positionPanelBelowStatusItem() {
-        guard let panel else { return }
-        guard let buttonWindow = statusItem?.button?.window else { return }
-
-        let statusItemFrame = buttonWindow.frame
-        let gapBelowMenuBar: CGFloat = 4
-
-        // Calculate the panel's content height from the hosting view's fitting size
-        // so the panel snugly wraps the SwiftUI content instead of using a fixed height.
-        let fittingSize = panel.contentView?.fittingSize ?? CGSize(width: panelWidth, height: panelHeight)
-        let actualPanelHeight = fittingSize.height
-
-        // Horizontally center the panel beneath the status item icon
-        let panelOriginX = statusItemFrame.midX - (panelWidth / 2)
-        let panelOriginY = statusItemFrame.minY - actualPanelHeight - gapBelowMenuBar
-
-        panel.setFrame(
-            NSRect(x: panelOriginX, y: panelOriginY, width: panelWidth, height: actualPanelHeight),
-            display: true
-        )
-    }
-
-    // MARK: - Click Outside Dismissal
-
-    /// Installs a global event monitor that hides the panel when the user clicks
-    /// anywhere outside it — the same transient dismissal behavior as NSPopover.
-    /// Uses a short delay so that system permission dialogs (triggered by Grant
-    /// buttons in the panel) don't immediately dismiss the panel when they appear.
-    private func installClickOutsideMonitor() {
-        removeClickOutsideMonitor()
-
-        clickOutsideMonitor = NSEvent.addGlobalMonitorForEvents(
-            matching: [.leftMouseDown, .rightMouseDown]
-        ) { [weak self] event in
-            guard let self, let panel = self.panel else { return }
-
-            // Check if the click is inside the status item button — if so, the
-            // statusItemClicked handler will toggle the panel, so don't also hide.
-            let clickLocation = NSEvent.mouseLocation
-            if panel.frame.contains(clickLocation) {
-                return
+            for modelOption in companionManager.availableModels {
+                let item = NSMenuItem(title: modelOption.displayName, action: #selector(modelMenuItemSelected(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = modelOption.id
+                item.state = modelOption.id == companionManager.selectedModel ? .on : .off
+                item.isEnabled = true
+                modelMenu.addItem(item)
             }
+        }
+        modelItem.submenu = modelMenu
+        menu.addItem(modelItem)
 
-            // Delay dismissal slightly to avoid closing the panel when
-            // a system permission dialog appears (e.g. microphone access).
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                guard panel.isVisible else { return }
+        if !companionManager.selectedModelReasoningEfforts.isEmpty {
+            let effortItem = NSMenuItem(title: "Thinking", action: nil, keyEquivalent: "")
+            let effortMenu = NSMenu()
+            for reasoningEffortOption in companionManager.selectedModelReasoningEfforts {
+                let item = NSMenuItem(title: reasoningEffortOption.displayName, action: #selector(reasoningEffortMenuItemSelected(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = reasoningEffortOption.id
+                item.state = reasoningEffortOption.id == companionManager.selectedReasoningEffort ? .on : .off
+                item.isEnabled = true
+                effortMenu.addItem(item)
+            }
+            effortItem.submenu = effortMenu
+            menu.addItem(effortItem)
+        }
 
-                // If permissions aren't all granted yet, a system dialog
-                // may have focus — don't dismiss during onboarding.
-                if !self.companionManager.allPermissionsGranted && !NSApp.isActive {
-                    return
+        if companionManager.hasFastModeCompatibleModel {
+            let fastModeItem = NSMenuItem(title: fastModeMenuTitle, action: #selector(fastModeMenuItemSelected), keyEquivalent: "")
+            fastModeItem.target = self
+            fastModeItem.state = companionManager.isFastModeEnabled ? .on : .off
+            fastModeItem.isEnabled = companionManager.selectedModelSupportsFastMode
+            menu.addItem(fastModeItem)
+        }
+    }
+
+    private var fastModeMenuTitle: String {
+        companionManager.selectedModelSupportsFastMode ? "Fast Mode" : "Fast Mode: Not Available"
+    }
+
+    private func addPermissionItems(to menu: NSMenu) {
+        let permissionsHeaderItem = NSMenuItem(title: "Permissions", action: nil, keyEquivalent: "")
+        permissionsHeaderItem.isEnabled = false
+        menu.addItem(permissionsHeaderItem)
+
+        addPermissionItem(
+            title: "Microphone",
+            isGranted: companionManager.hasMicrophonePermission,
+            action: #selector(grantMicrophoneMenuItemSelected),
+            to: menu
+        )
+        addPermissionItem(
+            title: "Accessibility",
+            isGranted: companionManager.hasAccessibilityPermission,
+            action: #selector(grantAccessibilityMenuItemSelected),
+            to: menu
+        )
+        addPermissionItem(
+            title: "Screen Recording",
+            isGranted: companionManager.hasScreenRecordingPermission,
+            action: #selector(grantScreenRecordingMenuItemSelected),
+            to: menu
+        )
+        if companionManager.hasScreenRecordingPermission {
+            addPermissionItem(
+                title: "Screen Content",
+                isGranted: companionManager.hasScreenContentPermission,
+                action: #selector(grantScreenContentMenuItemSelected),
+                to: menu
+            )
+        }
+
+        let refreshItem = NSMenuItem(title: "Refresh Permissions", action: #selector(refreshPermissionsMenuItemSelected), keyEquivalent: "")
+        refreshItem.target = self
+        refreshItem.isEnabled = true
+        menu.addItem(refreshItem)
+    }
+
+    private func addPermissionItem(title: String, isGranted: Bool, action: Selector, to menu: NSMenu) {
+        let itemTitle = isGranted ? "\(title): Granted" : "Grant \(title)"
+        let item = NSMenuItem(title: itemTitle, action: isGranted ? nil : action, keyEquivalent: "")
+        item.target = isGranted ? nil : self
+        item.state = isGranted ? .on : .off
+        item.isEnabled = !isGranted
+        menu.addItem(item)
+    }
+
+    private func addLifecycleItems(to menu: NSMenu) {
+        if !companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
+            let startItem = NSMenuItem(title: "Start Clicky", action: #selector(startClickyMenuItemSelected), keyEquivalent: "")
+            startItem.target = self
+            startItem.isEnabled = true
+            menu.addItem(startItem)
+        }
+
+        if companionManager.hasCompletedOnboarding {
+            let replayItem = NSMenuItem(title: "Watch Onboarding Again", action: #selector(replayOnboardingMenuItemSelected), keyEquivalent: "")
+            replayItem.target = self
+            replayItem.isEnabled = true
+            menu.addItem(replayItem)
+        }
+
+        let quitItem = NSMenuItem(title: "Quit Clicky", action: #selector(quitMenuItemSelected), keyEquivalent: "q")
+        quitItem.target = self
+        quitItem.isEnabled = true
+        menu.addItem(quitItem)
+    }
+
+    @objc private func showClickyMenuItemSelected() {
+        companionManager.setClickyCursorEnabled(!companionManager.isClickyCursorEnabled)
+    }
+
+    @objc private func signInToCodexMenuItemSelected() {
+        companionManager.beginCodexSignIn()
+    }
+
+    @objc private func refreshCodexMenuItemSelected() {
+        companionManager.refreshCodexConnectionState()
+    }
+
+    @objc private func modelMenuItemSelected(_ sender: NSMenuItem) {
+        guard let modelID = sender.representedObject as? String else { return }
+        companionManager.setSelectedModel(modelID)
+    }
+
+    @objc private func reasoningEffortMenuItemSelected(_ sender: NSMenuItem) {
+        guard let reasoningEffort = sender.representedObject as? String else { return }
+        companionManager.setSelectedReasoningEffort(reasoningEffort)
+    }
+
+    @objc private func fastModeMenuItemSelected() {
+        companionManager.setFastModeEnabled(!companionManager.isFastModeEnabled)
+    }
+
+    @objc private func grantMicrophoneMenuItemSelected() {
+        let authorizationStatus = AVCaptureDevice.authorizationStatus(for: .audio)
+        if authorizationStatus == .notDetermined {
+            let companionManager = companionManager
+            AVCaptureDevice.requestAccess(for: .audio) { _ in
+                Task { @MainActor in
+                    companionManager.refreshAllPermissions()
                 }
-
-                self.hidePanel()
             }
+            return
+        }
+
+        if let settingsURL = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone") {
+            NSWorkspace.shared.open(settingsURL)
         }
     }
 
-    private func removeClickOutsideMonitor() {
-        if let monitor = clickOutsideMonitor {
-            NSEvent.removeMonitor(monitor)
-            clickOutsideMonitor = nil
+    @objc private func grantAccessibilityMenuItemSelected() {
+        WindowPositionManager.requestAccessibilityPermission()
+    }
+
+    @objc private func grantScreenRecordingMenuItemSelected() {
+        WindowPositionManager.requestScreenRecordingPermission()
+    }
+
+    @objc private func grantScreenContentMenuItemSelected() {
+        companionManager.requestScreenContentPermission()
+    }
+
+    @objc private func refreshPermissionsMenuItemSelected() {
+        companionManager.refreshAllPermissions()
+    }
+
+    @objc private func startClickyMenuItemSelected() {
+        companionManager.triggerOnboarding()
+    }
+
+    @objc private func replayOnboardingMenuItemSelected() {
+        companionManager.replayOnboarding()
+    }
+
+    @objc private func quitMenuItemSelected() {
+        NSApp.terminate(nil)
+    }
+}
+
+extension MenuBarPanelManager: NSMenuDelegate {
+    nonisolated func menuDidClose(_ menu: NSMenu) {
+        Task { @MainActor [weak self] in
+            self?.statusItem?.menu = nil
+            self?.statusMenu = nil
         }
     }
 }

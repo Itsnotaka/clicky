@@ -1,28 +1,24 @@
-# AGENTS.md - leanring-buddy (Main App Target)
+# leanring-buddy
 
-## Source Files
+Main macOS app target. Follow the root `AGENTS.md` first.
 
-### FloatingSessionButton.swift
-- `FloatingSessionButtonManager` — `@MainActor` class managing the `NSPanel` lifecycle
-  - `showFloatingButton()` — Creates/shows the panel in top-right of primary screen
-  - `hideFloatingButton()` — Hides panel (keeps it alive for quick re-show)
-  - `destroyFloatingButton()` — Removes panel permanently (session ended)
-  - `onFloatingButtonClicked` — Callback closure, set by ContentView to bring main window to front
-  - `floatingButtonPanel` — Exposed `NSPanel` reference for screenshot exclusion
-- `FloatingButtonView` — Private SwiftUI view with gradient circle, scale+glow hover animation, pointer cursor
+## Commands
 
-### ContentView.swift
-- Receives `FloatingSessionButtonManager` via `@EnvironmentObject`
-- `isMainWindowCurrentlyFocused` — Tracks main window focus state
-- `configureFloatingButtonManager()` — Wires up the click callback
-- `startObservingMainWindowFocusChanges()` — Sets up `NSWindow` notification observers
-- `updateFloatingButtonVisibility()` — Core logic: show if running + not focused, hide otherwise
-- `bringMainWindowToFront()` — Activates app and orders main window front
+- Static validation: `xcrun swiftc -parse $(rg --files -g '*.swift' leanring-buddy)`.
+- Do not run `xcodebuild`; use Xcode with the `leanring-buddy` scheme.
+- Do not add or run tests unless the user explicitly asks.
 
-### ScreenshotManager.swift
-- `floatingButtonWindowToExcludeFromCaptures` — `NSWindow?` reference set by ContentView
-- `captureScreen()` — Matches the floating window to an `SCWindow` and excludes it from capture filter
+## Transcription
 
-### leanring_buddyApp.swift
-- Owns `FloatingSessionButtonManager` as `@StateObject`
-- Injects it into ContentView via `.environmentObject()`
+- Apple Speech is the supported speech-to-text backend.
+- Do not use Codex realtime conversation APIs for dictation.
+- Do not add direct OpenAI REST transcription without explicit request.
+
+## UI Rules
+
+- Use SwiftUI for normal views.
+- Use AppKit for menu bar, panels, windows, event taps, permissions, and ScreenCaptureKit integration.
+- Keep `NSMenu` native.
+- Keep overlay windows transparent and non-activating.
+- Keep UI state mutations on `@MainActor`.
+- Add pointer cursor behavior to interactive SwiftUI controls.
