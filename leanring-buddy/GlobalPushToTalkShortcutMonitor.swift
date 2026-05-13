@@ -17,6 +17,8 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
 
     private var globalEventTap: CFMachPort?
     private var globalEventTapRunLoopSource: CFRunLoopSource?
+    private var globalNSEventMonitor: Any?
+    private var localNSEventMonitor: Any?
     /// Mutated exclusively from the CGEvent tap callback, which runs on
     /// `CFRunLoopGetMain()` and therefore always executes on the main thread.
     /// Published so the overlay can hide immediately on key release without
@@ -28,12 +30,42 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
     }
 
     func start() {
-        // If the event tap is already running, don't restart it.
+        // If the monitors are already running, don't restart them.
         // Restarting resets isShortcutCurrentlyPressed, which would kill
         // the waveform overlay mid-press when the permission poller calls
-        // refreshAllPermissions → start() every few seconds.
-        guard globalEventTap == nil else { return }
+        // refreshAllPermissions -> start() every few seconds.
+        guard globalEventTap == nil && globalNSEventMonitor == nil && localNSEventMonitor == nil else { return }
 
+        if !startCGEventTap() {
+            startNSEventMonitors()
+        }
+    }
+
+    func stop() {
+        isShortcutCurrentlyPressed = false
+
+        if let globalEventTapRunLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), globalEventTapRunLoopSource, .commonModes)
+            self.globalEventTapRunLoopSource = nil
+        }
+
+        if let globalEventTap {
+            CFMachPortInvalidate(globalEventTap)
+            self.globalEventTap = nil
+        }
+
+        if let globalNSEventMonitor {
+            NSEvent.removeMonitor(globalNSEventMonitor)
+            self.globalNSEventMonitor = nil
+        }
+
+        if let localNSEventMonitor {
+            NSEvent.removeMonitor(localNSEventMonitor)
+            self.localNSEventMonitor = nil
+        }
+    }
+
+    private func startCGEventTap() -> Bool {
         let monitoredEventTypes: [CGEventType] = [.flagsChanged, .keyDown, .keyUp]
         let eventMask = monitoredEventTypes.reduce(CGEventMask(0)) { currentMask, eventType in
             currentMask | (CGEventMask(1) << eventType.rawValue)
@@ -62,8 +94,8 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
             callback: eventTapCallback,
             userInfo: Unmanaged.passUnretained(self).toOpaque()
         ) else {
-            print("⚠️ Global push-to-talk: couldn't create CGEvent tap")
-            return
+            print("Global push-to-talk: could not create CGEvent tap; using AppKit monitors")
+            return false
         }
 
         guard let globalEventTapRunLoopSource = CFMachPortCreateRunLoopSource(
@@ -72,8 +104,8 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
             0
         ) else {
             CFMachPortInvalidate(globalEventTap)
-            print("⚠️ Global push-to-talk: couldn't create event tap run loop source")
-            return
+            print("Global push-to-talk: could not create event tap run loop source; using AppKit monitors")
+            return false
         }
 
         self.globalEventTap = globalEventTap
@@ -81,20 +113,25 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
 
         CFRunLoopAddSource(CFRunLoopGetMain(), globalEventTapRunLoopSource, .commonModes)
         CGEvent.tapEnable(tap: globalEventTap, enable: true)
+        print("Global push-to-talk: CGEvent tap started")
+        return true
     }
 
-    func stop() {
-        isShortcutCurrentlyPressed = false
+    private func startNSEventMonitors() {
+        let eventMask: NSEvent.EventTypeMask = [.flagsChanged, .keyDown, .keyUp]
 
-        if let globalEventTapRunLoopSource {
-            CFRunLoopRemoveSource(CFRunLoopGetMain(), globalEventTapRunLoopSource, .commonModes)
-            self.globalEventTapRunLoopSource = nil
+        globalNSEventMonitor = NSEvent.addGlobalMonitorForEvents(matching: eventMask) { [weak self] event in
+            DispatchQueue.main.async {
+                self?.handleNSEvent(event, source: "global-appkit")
+            }
         }
 
-        if let globalEventTap {
-            CFMachPortInvalidate(globalEventTap)
-            self.globalEventTap = nil
+        localNSEventMonitor = NSEvent.addLocalMonitorForEvents(matching: eventMask) { [weak self] event in
+            self?.handleNSEvent(event, source: "local-appkit")
+            return event
         }
+
+        print("Global push-to-talk: AppKit monitor fallback started")
     }
 
     private func handleGlobalEventTap(
@@ -116,17 +153,34 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
             wasShortcutPreviouslyPressed: isShortcutCurrentlyPressed
         )
 
+        applyShortcutTransition(shortcutTransition, source: "cg-event-tap")
+        return Unmanaged.passUnretained(event)
+    }
+
+    private func handleNSEvent(_ event: NSEvent, source: String) {
+        let shortcutTransition = BuddyPushToTalkShortcut.shortcutTransition(
+            for: event,
+            wasShortcutPreviouslyPressed: isShortcutCurrentlyPressed
+        )
+
+        applyShortcutTransition(shortcutTransition, source: source)
+    }
+
+    private func applyShortcutTransition(
+        _ shortcutTransition: BuddyPushToTalkShortcut.ShortcutTransition,
+        source: String
+    ) {
         switch shortcutTransition {
         case .none:
             break
         case .pressed:
             isShortcutCurrentlyPressed = true
+            print("Push-to-talk pressed (\(source))")
             shortcutTransitionPublisher.send(.pressed)
         case .released:
             isShortcutCurrentlyPressed = false
+            print("Push-to-talk released (\(source))")
             shortcutTransitionPublisher.send(.released)
         }
-
-        return Unmanaged.passUnretained(event)
     }
 }

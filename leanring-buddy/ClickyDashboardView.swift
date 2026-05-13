@@ -93,7 +93,7 @@ struct ClickyDashboardView: View {
                 clickyUpdaterManager: clickyUpdaterManager,
                 dashboardPromptInput: $dashboardPromptInput,
                 submitDashboardPrompt: submitDashboardPrompt,
-                refreshCodexState: companionManager.refreshCodexConnectionState,
+                refreshAgentState: companionManager.refreshCodingAgentConnectionState,
                 checkForUpdates: checkForUpdates
             )
         case .modelAndVoice:
@@ -124,47 +124,55 @@ struct ClickyDashboardView: View {
     private var dashboardStatusText: String {
         guard companionManager.isAgentRunning else { return "Paused" }
 
-        switch companionManager.codexConnectionState {
-        case .checking:
-            return "Checking Codex"
-        case .needsSignIn:
-            return "Sign in required"
-        case .unavailable:
-            return "Codex unavailable"
-        case .ready:
-            switch companionManager.voiceState {
-            case .idle: return "Ready"
-            case .listening: return "Listening"
-            case .processing: return "Thinking"
-            case .responding: return "Responding"
+        if !companionManager.isActiveCodingAgentReady {
+            switch companionManager.codexConnectionState {
+            case .checking:
+                return "Checking Codex"
+            case .needsSignIn:
+                return "Sign in required"
+            case .unavailable:
+                return "Codex unavailable"
+            case .ready:
+                return companionManager.realtimeVoiceStatusText == "Ready" ? "Ready" : "Realtime unavailable"
             }
+        }
+
+        switch companionManager.voiceState {
+        case .idle: return "Ready"
+        case .listening: return "Listening"
+        case .processing: return "Thinking"
+        case .responding: return "Responding"
         }
     }
 
     private var dashboardStatusColor: Color {
         guard companionManager.isAgentRunning else { return DS.Colors.textTertiary }
 
-        switch companionManager.codexConnectionState {
-        case .checking:
-            return DS.Colors.textTertiary
-        case .needsSignIn:
-            return DS.Colors.warning
-        case .unavailable:
-            return DS.Colors.destructiveText
-        case .ready:
-            switch companionManager.voiceState {
-            case .idle: return DS.Colors.success
-            case .listening, .processing, .responding: return DS.Colors.accentText
+        if !companionManager.isActiveCodingAgentReady {
+            switch companionManager.codexConnectionState {
+            case .checking:
+                return DS.Colors.textTertiary
+            case .needsSignIn:
+                return DS.Colors.warning
+            case .unavailable:
+                return DS.Colors.destructiveText
+            case .ready:
+                return companionManager.realtimeVoiceStatusText == "Ready" ? DS.Colors.success : DS.Colors.warning
             }
+        }
+
+        switch companionManager.voiceState {
+        case .idle: return DS.Colors.success
+        case .listening, .processing, .responding: return DS.Colors.accentText
         }
     }
 
     private func subtitle(for section: ClickyDashboardSection) -> String {
         switch section {
         case .overview:
-            return "Run state, Codex health, and a desktop prompt entry point."
+            return "Run state, Codex realtime health, and a desktop prompt entry point."
         case .modelAndVoice:
-            return "Choose the Codex model behavior without crowding the menu bar."
+            return "Choose Codex model behavior and realtime voice without crowding the menu bar."
         case .cursor:
             return "Control Clicky's persistent and transient cursor behavior."
         case .computerUse:
@@ -176,6 +184,8 @@ struct ClickyDashboardView: View {
 
     private func refreshDashboardState() {
         clickyUpdaterManager.refreshUpdateAvailability()
+        companionManager.refreshCodingAgentConnectionState()
+        companionManager.refreshComputerUseMCPStatus()
         refreshComputerUseContext()
         refreshLogs()
     }

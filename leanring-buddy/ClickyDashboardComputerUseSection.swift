@@ -96,6 +96,11 @@ struct ClickyDashboardComputerUseSection: View {
                 }
             }
 
+            ClickyDashboardComputerUseMCPCard(
+                status: companionManager.computerUseMCPStatus,
+                refreshStatus: companionManager.refreshComputerUseMCPStatus
+            )
+
             ClickyDashboardCard(title: "Focused window", subtitle: "This is the window-level context Clicky can now inspect separately from full-screen capture.") {
                 if let focusedWindow = computerUseWindowContextController.focusedWindow {
                     VStack(alignment: .leading, spacing: 10) {
@@ -134,6 +139,105 @@ struct ClickyDashboardComputerUseSection: View {
     private func refreshPermissionState() {
         companionManager.refreshAllPermissions()
         refreshComputerUseContext()
+    }
+}
+
+private struct ClickyDashboardComputerUseMCPCard: View {
+    let status: CompanionComputerUseMCPStatus
+    let refreshStatus: () -> Void
+
+    var body: some View {
+        ClickyDashboardCard(
+            title: "Codex Computer Use App Approval",
+            subtitle: "MCP app approvals are separate from macOS Accessibility and Screen Recording."
+        ) {
+            VStack(alignment: .leading, spacing: 10) {
+                ClickyDashboardInfoRow(
+                    title: "Status",
+                    value: status.appApprovalStatusText,
+                    systemImageName: status.isReadyForAppApproval ? "checkmark.shield" : "exclamationmark.triangle"
+                )
+                Divider()
+                ClickyDashboardInfoRow(
+                    title: "Codex app",
+                    value: status.codexAppURL?.path ?? status.discoveryStatusText,
+                    systemImageName: "app"
+                )
+                Divider()
+                ClickyDashboardInfoRow(
+                    title: "Plugin",
+                    value: status.pluginDirectoryURL?.path ?? status.discoveryStatusText,
+                    systemImageName: "shippingbox"
+                )
+                Divider()
+                ClickyDashboardInfoRow(
+                    title: "MCP server",
+                    value: status.mcpServerFound ? "Ready (\(status.mcpToolCount) tools)" : "Not available",
+                    systemImageName: "point.3.connected.trianglepath.dotted"
+                )
+                Divider()
+                ClickyDashboardInfoRow(
+                    title: "Approval store",
+                    value: "\(status.approvalStore.statusText) - \(status.approvalStore.fileURL.path)",
+                    systemImageName: "folder.badge.gearshape"
+                )
+                Divider()
+                ClickyDashboardInfoRow(
+                    title: "Store detail",
+                    value: status.approvalStore.detailText,
+                    systemImageName: "doc.text"
+                )
+                Divider()
+                ClickyDashboardInfoRow(
+                    title: "Focused app",
+                    value: focusedAppText,
+                    systemImageName: "scope"
+                )
+
+                if let lastApprovalResult = status.lastApprovalResult {
+                    Divider()
+                    ClickyDashboardInfoRow(
+                        title: "Last approval",
+                        value: "\(lastApprovalResult.statusText) - \(lastApprovalResult.detailText)",
+                        systemImageName: lastApprovalResult.accepted ? "checkmark.circle" : "xmark.circle"
+                    )
+                }
+
+                if let lastRefreshErrorMessage = status.lastRefreshErrorMessage {
+                    Divider()
+                    Text(lastRefreshErrorMessage)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(DS.Colors.destructiveText)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Button(action: refreshStatus) {
+                    Label("Refresh Computer Use MCP", systemImage: "arrow.clockwise")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.regular)
+                .padding(.top, 4)
+                .pointerCursor()
+            }
+        }
+    }
+
+    private var focusedAppText: String {
+        let appName = status.currentAppName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let bundleIdentifier = status.currentBundleIdentifier?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if let appName, !appName.isEmpty,
+           let bundleIdentifier, !bundleIdentifier.isEmpty {
+            return "\(appName) (\(bundleIdentifier))"
+        }
+        if let appName, !appName.isEmpty {
+            return appName
+        }
+        if let bundleIdentifier, !bundleIdentifier.isEmpty {
+            return bundleIdentifier
+        }
+        return "No regular focused app"
     }
 }
 

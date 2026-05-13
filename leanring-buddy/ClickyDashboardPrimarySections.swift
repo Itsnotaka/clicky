@@ -6,7 +6,6 @@
 //
 
 import AVFoundation
-import Speech
 import SwiftUI
 
 struct ClickyDashboardOverviewSection: View {
@@ -14,7 +13,7 @@ struct ClickyDashboardOverviewSection: View {
     @ObservedObject var clickyUpdaterManager: ClickyUpdaterManager
     @Binding var dashboardPromptInput: String
     let submitDashboardPrompt: () -> Void
-    let refreshCodexState: () -> Void
+    let refreshAgentState: () -> Void
     let checkForUpdates: () -> Void
 
     var body: some View {
@@ -62,8 +61,8 @@ struct ClickyDashboardOverviewSection: View {
             }
 
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 190), spacing: 12)], spacing: 12) {
-                ClickyDashboardMetricCard(title: "Codex", value: codexStatusText, systemImageName: "sparkles")
-                ClickyDashboardMetricCard(title: "Model", value: companionManager.selectedModelDisplayName, systemImageName: "cpu")
+                ClickyDashboardMetricCard(title: "Agent", value: companionManager.activeCodingAgentStatusLabel, systemImageName: "sparkles")
+                ClickyDashboardMetricCard(title: "Model", value: companionManager.dashboardModelMetricLabel, systemImageName: "cpu")
                 ClickyDashboardMetricCard(title: "Voice", value: companionManager.speechOutputDisplayName, systemImageName: "speaker.wave.2")
                 ClickyDashboardMetricCard(title: "Cursor", value: companionManager.isOverlayVisible ? "Visible" : "Hidden", systemImageName: "cursorarrow")
                 ClickyDashboardMetricCard(title: "Updates", value: clickyUpdaterManager.updateStatusText, systemImageName: "arrow.triangle.2.circlepath")
@@ -74,8 +73,8 @@ struct ClickyDashboardOverviewSection: View {
 
             ClickyDashboardCard {
                 HStack(spacing: 10) {
-                    Button(action: refreshCodexState) {
-                        Label("Refresh Codex", systemImage: "arrow.clockwise")
+                    Button(action: refreshAgentState) {
+                        Label("Refresh agent", systemImage: "arrow.clockwise")
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.regular)
@@ -95,18 +94,6 @@ struct ClickyDashboardOverviewSection: View {
         }
     }
 
-    private var codexStatusText: String {
-        switch companionManager.codexConnectionState {
-        case .checking:
-            return "Checking"
-        case .needsSignIn:
-            return "Sign in"
-        case .ready(let planType):
-            return planType?.isEmpty == false ? "Ready (\(planType!))" : "Ready"
-        case .unavailable:
-            return "Unavailable"
-        }
-    }
 }
 
 private struct ClickyDashboardPermissionRequirement: Identifiable {
@@ -163,6 +150,7 @@ private struct ClickyDashboardPermissionsCard: View {
 
     private var permissionRequirements: [ClickyDashboardPermissionRequirement] {
         let browserAutomationPermissionStatus = companionManager.browserAutomationPermissionStatus
+        let computerUseMCPStatus = companionManager.computerUseMCPStatus
 
         return [
             ClickyDashboardPermissionRequirement(
@@ -226,28 +214,6 @@ private struct ClickyDashboardPermissionsCard: View {
                 }
             ),
             ClickyDashboardPermissionRequirement(
-                id: "speech-recognition",
-                iconName: "waveform.and.mic",
-                permissionName: "Speech Recognition",
-                permissionStatusText: companionManager.hasSpeechRecognitionPermission ? "Granted" : "Missing",
-                detailText: "Voice transcription",
-                isGranted: companionManager.hasSpeechRecognitionPermission,
-                actionTitle: "Grant",
-                action: {
-                    let speechRecognitionAuthorizationStatus = SFSpeechRecognizer.authorizationStatus()
-                    if speechRecognitionAuthorizationStatus == .notDetermined {
-                        SFSpeechRecognizer.requestAuthorization { _ in
-                            Task { @MainActor in
-                                companionManager.refreshAllPermissions()
-                            }
-                        }
-                    } else if let speechRecognitionSettingsURL = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_SpeechRecognition") {
-                        NSWorkspace.shared.open(speechRecognitionSettingsURL)
-                        companionManager.refreshAllPermissions()
-                    }
-                }
-            ),
-            ClickyDashboardPermissionRequirement(
                 id: "browser-automation",
                 iconName: "globe",
                 permissionName: "Browser Automation",
@@ -264,6 +230,18 @@ private struct ClickyDashboardPermissionsCard: View {
                     case .needsPermission, .denied, .unavailable:
                         companionManager.requestBrowserAutomationPermission()
                     }
+                }
+            ),
+            ClickyDashboardPermissionRequirement(
+                id: "computer-use-mcp-app-approval",
+                iconName: "point.3.connected.trianglepath.dotted",
+                permissionName: "Codex Computer Use App Approval",
+                permissionStatusText: computerUseMCPStatus.appApprovalStatusText,
+                detailText: computerUseMCPStatus.appApprovalDetailText,
+                isGranted: computerUseMCPStatus.isReadyForAppApproval,
+                actionTitle: "Refresh",
+                action: {
+                    companionManager.refreshComputerUseMCPStatus()
                 }
             )
         ]
@@ -316,9 +294,9 @@ struct ClickyDashboardModelAndVoiceSection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            ClickyDashboardCodexStatusCard(companionManager: companionManager)
+            ClickyDashboardAgentStatusCard(companionManager: companionManager)
 
-            ClickyDashboardCard(title: "Model behavior", subtitle: "These controls affect Codex app-server turns for voice and typed prompts.") {
+            ClickyDashboardCard(title: "Model behavior", subtitle: "Voice and typed prompts use the local Codex app-server realtime session.") {
                 VStack(spacing: 0) {
                     ClickyDashboardControlRow(title: "Model", subtitle: "Use the models returned by your local Codex account.", systemImageName: "cpu") {
                         Picker("Model", selection: Binding(
@@ -373,9 +351,30 @@ struct ClickyDashboardModelAndVoiceSection: View {
                 }
             }
 
-            ClickyDashboardCard(title: "Voice", subtitle: "Local voice remains native so the app does not need speech API keys.") {
+            ClickyDashboardCard(title: "Realtime voice", subtitle: "Codex streams microphone audio in and realtime audio back out.") {
                 VStack(spacing: 0) {
-                    ClickyDashboardInfoRow(title: "Speech output", value: companionManager.speechOutputDisplayName, systemImageName: "speaker.wave.2")
+                    ClickyDashboardControlRow(title: "Voice", subtitle: companionManager.realtimeVoiceDetailText, systemImageName: "speaker.wave.2") {
+                        Picker("Voice", selection: Binding(
+                            get: { companionManager.selectedRealtimeVoice },
+                            set: { companionManager.setSelectedRealtimeVoice($0) }
+                        )) {
+                            if companionManager.realtimeVoiceOptions.isEmpty {
+                                Text("Default").tag("")
+                            }
+
+                            ForEach(companionManager.realtimeVoiceOptions) { voiceOption in
+                                Text(voiceOption.displayName).tag(voiceOption.id)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.menu)
+                        .frame(maxWidth: 220)
+                        .disabled(companionManager.realtimeVoiceOptions.isEmpty)
+                        .pointerCursor(isEnabled: !companionManager.realtimeVoiceOptions.isEmpty)
+                    }
+
+                    Divider()
+                    ClickyDashboardInfoRow(title: "Realtime status", value: companionManager.realtimeVoiceStatusText, systemImageName: "dot.radiowaves.left.and.right")
                     Divider()
                     ClickyDashboardInfoRow(title: "Push to talk", value: BuddyPushToTalkShortcut.pushToTalkDisplayText, systemImageName: "keyboard")
                 }
@@ -384,7 +383,7 @@ struct ClickyDashboardModelAndVoiceSection: View {
     }
 }
 
-struct ClickyDashboardCodexStatusCard: View {
+struct ClickyDashboardAgentStatusCard: View {
     @ObservedObject var companionManager: CompanionManager
 
     var body: some View {
@@ -417,7 +416,7 @@ struct ClickyDashboardCodexStatusCard: View {
                     .controlSize(.regular)
                     .pointerCursor()
                 } else {
-                    Button(action: companionManager.refreshCodexConnectionState) {
+                    Button(action: companionManager.refreshCodingAgentConnectionState) {
                         Label("Refresh", systemImage: "arrow.clockwise")
                     }
                     .buttonStyle(.bordered)
@@ -435,7 +434,7 @@ struct ClickyDashboardCodexStatusCard: View {
         case .needsSignIn:
             return "Sign in needed"
         case .ready:
-            return "Codex ready"
+            return companionManager.realtimeVoiceStatusText == "Ready" ? "Codex realtime ready" : "Codex ready"
         case .unavailable:
             return "Codex unavailable"
         }
@@ -448,7 +447,10 @@ struct ClickyDashboardCodexStatusCard: View {
         case .needsSignIn:
             return "Authenticate through Codex with your ChatGPT subscription."
         case .ready(let planType):
-            return planType?.isEmpty == false ? "Authenticated with plan \(planType!)." : "Authenticated and ready for local app-server turns."
+            if companionManager.realtimeVoiceStatusText != "Ready" {
+                return companionManager.realtimeVoiceDetailText
+            }
+            return planType?.isEmpty == false ? "Authenticated with plan \(planType!)." : "Authenticated and ready for realtime voice."
         case .unavailable(let message):
             return message
         }
@@ -458,7 +460,7 @@ struct ClickyDashboardCodexStatusCard: View {
         switch companionManager.codexConnectionState {
         case .checking: return "clock"
         case .needsSignIn: return "person.crop.circle.badge.exclamationmark"
-        case .ready: return "checkmark.seal.fill"
+        case .ready: return companionManager.realtimeVoiceStatusText == "Ready" ? "checkmark.seal.fill" : "exclamationmark.triangle.fill"
         case .unavailable: return "exclamationmark.triangle.fill"
         }
     }
@@ -467,7 +469,7 @@ struct ClickyDashboardCodexStatusCard: View {
         switch companionManager.codexConnectionState {
         case .checking: return DS.Colors.textTertiary
         case .needsSignIn: return DS.Colors.warning
-        case .ready: return DS.Colors.success
+        case .ready: return companionManager.realtimeVoiceStatusText == "Ready" ? DS.Colors.success : DS.Colors.warning
         case .unavailable: return DS.Colors.destructiveText
         }
     }

@@ -107,6 +107,13 @@ struct NavigationBubbleSizePreferenceKey: PreferenceKey {
     }
 }
 
+struct StreamingPreviewBubbleSizePreferenceKey: PreferenceKey {
+    static var defaultValue: CGSize = .zero
+    static func reduce(value: inout CGSize, nextValue: () -> CGSize) {
+        value = nextValue()
+    }
+}
+
 /// The buddy's behavioral mode. Controls whether it follows the cursor,
 /// is flying toward a detected UI element, or is pointing at an element.
 enum BuddyNavigationMode {
@@ -122,8 +129,8 @@ enum BuddyNavigationMode {
 // Each screen gets its own BlueCursorView. The view checks whether
 // the cursor is currently on THIS screen and only shows the buddy
 // triangle when it is. During voice interaction, the triangle is
-// replaced by a waveform (listening), spinner (processing), or
-// streaming text bubble (responding).
+// replaced by a waveform (listening), spinner (processing, with an
+// optional live Codex reply preview), or plain pointer (responding).
 struct BlueCursorView: View {
     let screenFrame: CGRect
     let isFirstAppearance: Bool
@@ -182,6 +189,8 @@ struct BlueCursorView: View {
     /// Scale factor for the navigation speech bubble's pop-in entrance.
     /// Starts at 0.5 and springs to 1.0 when the first character appears.
     @State private var navigationBubbleScale: CGFloat = 1.0
+
+    @State private var streamingPreviewBubbleSize: CGSize = .zero
 
     /// True when the buddy is flying BACK to the cursor after pointing.
     /// Only during the return flight can cursor movement cancel the animation.
@@ -256,6 +265,40 @@ struct BlueCursorView: View {
                     .animation(.easeOut(duration: 0.4), value: companionManager.onboardingPromptOpacity)
                     .onPreferenceChange(SizePreferenceKey.self) { newSize in
                         bubbleSize = newSize
+                    }
+            }
+
+            // Live Codex assistant text (turn stream deltas) while the spinner shows.
+            if isCursorOnThisScreen
+                && companionManager.voiceState == .processing
+                && !companionManager.codexVoiceStreamingPreviewForDisplay.isEmpty {
+                Text(companionManager.codexVoiceStreamingPreviewForDisplay)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(.white)
+                    .lineLimit(4)
+                    .multilineTextAlignment(.leading)
+                    .frame(maxWidth: 280, alignment: .leading)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(DS.Colors.overlayCursor)
+                            .shadow(color: DS.Colors.overlayCursor.opacity(0.5), radius: 6, x: 0, y: 0)
+                    )
+                    .fixedSize(horizontal: false, vertical: true)
+                    .overlay(
+                        GeometryReader { geo in
+                            Color.clear
+                                .preference(key: StreamingPreviewBubbleSizePreferenceKey.self, value: geo.size)
+                        }
+                    )
+                    .position(
+                        x: cursorPosition.x + 10 + (streamingPreviewBubbleSize.width / 2),
+                        y: cursorPosition.y + 18
+                    )
+                    .animation(.spring(response: 0.2, dampingFraction: 0.6, blendDuration: 0), value: cursorPosition)
+                    .onPreferenceChange(StreamingPreviewBubbleSizePreferenceKey.self) { newSize in
+                        streamingPreviewBubbleSize = newSize
                     }
             }
 

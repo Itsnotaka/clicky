@@ -2,9 +2,8 @@
 //  CompanionManager.swift
 //  leanring-buddy
 //
-//  Central state manager for the companion voice mode. Owns the push-to-talk
-//  pipeline (dictation manager + global shortcut monitor + overlay) and
-//  exposes observable voice state for the menu and overlay UI.
+//  Central state manager for the companion voice mode. Owns push-to-talk,
+//  Codex realtime voice, computer-use, and overlay UI state.
 //
 
 import AVFoundation
@@ -13,7 +12,7 @@ import Foundation
 import ScreenCaptureKit
 import SwiftUI
 
-enum CompanionVoiceState {
+enum CompanionVoiceState: Equatable {
     case idle
     case listening
     case processing
@@ -29,13 +28,32 @@ enum CodexConnectionState: Equatable {
 
 @MainActor
 final class CompanionManager: ObservableObject {
+    private static let defaultCodexModelID = "gpt-5.5"
+    private static let defaultCodexReasoningEffort = "none"
+
+    private static let computerUseDemoPrompt = """
+    demo mode: keep all spoken output to a few short sentences total. first say one sentence explaining clicky: a macos menu bar companion with push-to-talk, screen context, and computer use to drive apps. then use computer use: if a web browser is frontmost, use it; otherwise open the default browser. open https://www.youtube.com/watch?v=dQw4w9WgXcQ and start playback (click play if needed). do not sign in, comment, change settings, or do anything beyond that url and playing the video. end with one short confirmation that it is playing.
+    """
+
     @Published private(set) var voiceState: CompanionVoiceState = .idle
+    /// Accumulated assistant text from Codex realtime transcript events while a voice turn is in flight.
+    @Published private(set) var codexVoiceStreamingText: String = ""
+    /// Strips trailing `[POINT:...]` from in-progress streamed text so the overlay does not flash raw tags.
+    var codexVoiceStreamingPreviewForDisplay: String {
+        let raw = codexVoiceStreamingText
+        if let range = raw.range(of: "[POINT:", options: .literal) {
+            return String(raw[..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return raw
+    }
+
     @Published private(set) var lastTranscript: String?
     @Published private(set) var currentAudioPowerLevel: CGFloat = 0
     @Published private(set) var hasAccessibilityPermission = false
     @Published private(set) var hasScreenRecordingPermission = false
     @Published private(set) var hasMicrophonePermission = false
     @Published private(set) var hasScreenContentPermission = false
+    @Published private(set) var isAgentRunning = false
 
     /// Screen location (global AppKit coords) of a detected UI element the
     /// buddy should fly to and point at. Parsed from Codex's response;
@@ -60,31 +78,33 @@ final class CompanionManager: ObservableObject {
     private var onboardingMusicPlayer: AVAudioPlayer?
     private var onboardingMusicFadeTimer: Timer?
 
-    let buddyDictationManager = BuddyDictationManager()
+    let realtimeVoiceManager = RealtimeVoiceManager()
     let globalPushToTalkShortcutMonitor = GlobalPushToTalkShortcutMonitor()
     let overlayWindowManager = OverlayWindowManager()
+    let computerUseWindowContextController = CompanionComputerUseWindowContextController()
 
     private let codexAppServerClient = CodexAppServerClient.shared
-    private var nativeSpeechSynthesizer: NSSpeechSynthesizer?
-
-    /// The currently running AI response task, if any. Cancelled when the user
-    /// speaks again so a new response can begin immediately.
-    private var currentResponseTask: Task<Void, Never>?
 
     private var shortcutTransitionCancellable: AnyCancellable?
     private var voiceStateCancellable: AnyCancellable?
     private var audioPowerCancellable: AnyCancellable?
+    private var realtimeVoiceManagerCancellable: AnyCancellable?
     private var accessibilityCheckTimer: Timer?
     private var codexSignInPollingTask: Task<Void, Never>?
     private var pendingKeyboardShortcutStartTask: Task<Void, Never>?
+    private var browserAutomationPermissionStatusTask: Task<Void, Never>?
     /// Scheduled hide for transient cursor mode — cancelled if the user
     /// speaks again before the delay elapses.
     private var transientHideTask: Task<Void, Never>?
+    private var macCursorIdleTimer: Timer?
+    private var macCursorActivityMonitor: Any?
 
-    /// True when all three required permissions (accessibility, screen recording,
-    /// microphone) are granted. Used by the menu to show a single "all good" state.
+    /// True when required permissions are granted. Used by the menu to show a single "all good" state.
     var allPermissionsGranted: Bool {
-        hasAccessibilityPermission && hasScreenRecordingPermission && hasMicrophonePermission && hasScreenContentPermission
+        hasAccessibilityPermission
+            && hasScreenRecordingPermission
+            && hasMicrophonePermission
+            && hasScreenContentPermission
     }
 
     /// Whether the orange cursor overlay is currently visible on screen.
@@ -92,16 +112,105 @@ final class CompanionManager: ObservableObject {
     @Published private(set) var isOverlayVisible: Bool = false
 
     /// The Codex model used for voice responses. Persisted to UserDefaults.
-    @Published var selectedModel: String = UserDefaults.standard.string(forKey: "selectedCodexModel") ?? ""
-    @Published var selectedReasoningEffort: String = UserDefaults.standard.string(forKey: "selectedCodexReasoningEffort") ?? ""
-    @Published var isFastModeEnabled: Bool = UserDefaults.standard.bool(forKey: "isCodexFastModeEnabled")
+    @Published var selectedModel: String = UserDefaults.standard.string(forKey: "selectedCodexModel") ?? CompanionManager.defaultCodexModelID
+    @Published var selectedReasoningEffort: String = UserDefaults.standard.string(forKey: "selectedCodexReasoningEffort") ?? CompanionManager.defaultCodexReasoningEffort
+    @Published var isFastModeEnabled: Bool = UserDefaults.standard.object(forKey: "isCodexFastModeEnabled") == nil ? true : UserDefaults.standard.bool(forKey: "isCodexFastModeEnabled")
     @Published private(set) var availableModels: [CodexModelOption] = []
     @Published private(set) var codexConnectionState: CodexConnectionState = .checking
+    @Published private(set) var computerUseMCPStatus: CompanionComputerUseMCPStatus = .checking()
+    @Published private(set) var browserAutomationPermissionStatus: CompanionBrowserAutomationPermissionStatus = .checking
+
+    var speechOutputDisplayName: String {
+        realtimeVoiceDisplayName
+    }
+
+    var isActiveCodingAgentReady: Bool {
+        guard case .ready = codexConnectionState else {
+            return false
+        }
+        return realtimeVoiceManager.isRealtimeAvailable
+    }
+
+    /// Menu-bar computer-use demo: does not require `isAgentRunning` so it stays available when the dashboard pauses push-to-talk.
+    var isComputerUseDemoMenuEnabled: Bool {
+        allPermissionsGranted && isActiveCodingAgentReady
+    }
+
+    var activeCodingAgentStatusLabel: String {
+        switch codexConnectionState {
+        case .checking:
+            return "Checking"
+        case .needsSignIn:
+            return "Sign in"
+        case .ready(let planType):
+            if !realtimeVoiceManager.isRealtimeAvailable {
+                return "Realtime \(realtimeVoiceManager.statusText)"
+            }
+            return planType?.isEmpty == false ? "Ready (\(planType!))" : "Ready"
+        case .unavailable:
+            return "Unavailable"
+        }
+    }
+
+    var realtimeVoiceOptions: [CodexRealtimeVoiceOption] {
+        realtimeVoiceManager.availableVoiceOptions
+    }
+
+    var selectedRealtimeVoice: String {
+        realtimeVoiceManager.selectedVoiceID
+    }
+
+    var realtimeVoiceDisplayName: String {
+        realtimeVoiceManager.selectedVoiceDisplayName
+    }
+
+    var realtimeVoiceStatusText: String {
+        realtimeVoiceManager.statusText
+    }
+
+    var realtimeVoiceDetailText: String {
+        realtimeVoiceManager.detailText
+    }
+
+    init() {
+        realtimeVoiceManager.configure(
+            captureScreens: {
+                try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+            },
+            pointAt: { [weak self] location, displayFrame, label in
+                self?.setDetectedElementLocation(
+                    location,
+                    displayFrame: displayFrame,
+                    bubbleText: label
+                )
+            },
+            onAssistantTranscript: { [weak self] text in
+                self?.codexVoiceStreamingText = text
+            },
+            onUserTranscript: { [weak self] transcript in
+                self?.lastTranscript = transcript
+            }
+        )
+
+        realtimeVoiceManagerCancellable = realtimeVoiceManager.objectWillChange
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.objectWillChange.send()
+            }
+    }
+
+    func refreshCodingAgentConnectionState() {
+        refreshCodexConnectionState()
+    }
 
     func setSelectedModel(_ model: String) {
         selectedModel = model
         UserDefaults.standard.set(model, forKey: "selectedCodexModel")
         normalizeSelectedCodexModelSettings()
+
+        if model == Self.defaultCodexModelID && selectedModelSupportsFastMode {
+            setFastModeEnabled(true)
+        }
     }
 
     func setSelectedReasoningEffort(_ reasoningEffort: String) {
@@ -114,8 +223,20 @@ final class CompanionManager: ObservableObject {
         UserDefaults.standard.set(isFastModeEnabled, forKey: "isCodexFastModeEnabled")
     }
 
+    func setSelectedRealtimeVoice(_ voiceID: String) {
+        realtimeVoiceManager.setSelectedVoiceID(voiceID)
+    }
+
+    func refreshRealtimeVoices() {
+        realtimeVoiceManager.refreshAvailableVoices()
+    }
+
     var selectedModelDisplayName: String {
         availableModels.first(where: { $0.id == selectedModel })?.displayName ?? (selectedModel.isEmpty ? "Default" : selectedModel)
+    }
+
+    var dashboardModelMetricLabel: String {
+        selectedModelDisplayName
     }
 
     var selectedModelReasoningEfforts: [CodexReasoningEffortOption] {
@@ -154,6 +275,54 @@ final class CompanionManager: ObservableObject {
                     self.codexConnectionState = .unavailable(message: error.localizedDescription)
                 }
             }
+        }
+    }
+
+    func refreshComputerUseMCPStatus() {
+        Task {
+            let status = await codexAppServerClient.refreshComputerUseMCPStatus()
+            await MainActor.run {
+                self.computerUseMCPStatus = status
+            }
+        }
+    }
+
+    func refreshBrowserAutomationPermissionStatus() {
+        browserAutomationPermissionStatusTask?.cancel()
+        browserAutomationPermissionStatusTask = Task {
+            let status = await CompanionBrowserAutomationPermissionManager.currentPermissionStatus()
+            guard !Task.isCancelled else { return }
+            browserAutomationPermissionStatus = status
+        }
+    }
+
+    func requestBrowserAutomationPermission() {
+        browserAutomationPermissionStatusTask?.cancel()
+        browserAutomationPermissionStatus = .checking
+        browserAutomationPermissionStatusTask = Task {
+            let status = await CompanionBrowserAutomationPermissionManager.requestPermissionForPreferredRunningBrowser()
+            guard !Task.isCancelled else { return }
+            browserAutomationPermissionStatus = status
+        }
+    }
+
+    func openBrowserAutomationPermissionHelper() {
+        for browserTarget in CompanionBrowserAutomationTarget.supportedBrowsers {
+            guard let applicationURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: browserTarget.bundleIdentifier) else {
+                continue
+            }
+
+            let configuration = NSWorkspace.OpenConfiguration()
+            NSWorkspace.shared.openApplication(at: applicationURL, configuration: configuration) { [weak self] _, _ in
+                Task { @MainActor [weak self] in
+                    self?.refreshBrowserAutomationPermissionStatus()
+                }
+            }
+            return
+        }
+
+        if let automationSettingsURL = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation") {
+            NSWorkspace.shared.open(automationSettingsURL)
         }
     }
 
@@ -204,8 +373,12 @@ final class CompanionManager: ObservableObject {
     private func applyCodexSnapshot(_ snapshot: CodexAppServerSnapshot) {
         availableModels = snapshot.models
 
-        if let defaultModelID = snapshot.defaultModelID,
-           !availableModels.contains(where: { $0.id == selectedModel }) {
+        let selectedModelIsAvailable = availableModels.contains(where: { $0.id == selectedModel })
+        if let preferredDefaultModelID = Self.preferredDefaultModelID(from: availableModels),
+           !selectedModelIsAvailable || selectedModel == snapshot.defaultModelID {
+            setSelectedModel(preferredDefaultModelID)
+        } else if let defaultModelID = snapshot.defaultModelID,
+                  !selectedModelIsAvailable {
             setSelectedModel(defaultModelID)
         }
 
@@ -217,15 +390,14 @@ final class CompanionManager: ObservableObject {
         }
 
         codexConnectionState = .ready(planType: snapshot.account.planType)
+        refreshRealtimeVoices()
     }
 
     private func normalizeSelectedCodexModelSettings() {
         guard let selectedModelOption else { return }
 
-        if !selectedModelOption.supportedReasoningEfforts.contains(where: { $0.id == selectedReasoningEffort }) {
-            let defaultReasoningEffort = selectedModelOption.defaultReasoningEffort
-                ?? selectedModelOption.supportedReasoningEfforts.first?.id
-                ?? ""
+        if shouldUseDefaultReasoningEffort(for: selectedModelOption) {
+            let defaultReasoningEffort = Self.defaultReasoningEffort(for: selectedModelOption)
             selectedReasoningEffort = defaultReasoningEffort
             UserDefaults.standard.set(defaultReasoningEffort, forKey: "selectedCodexReasoningEffort")
         }
@@ -236,16 +408,59 @@ final class CompanionManager: ObservableObject {
         }
     }
 
+    private func shouldUseDefaultReasoningEffort(for modelOption: CodexModelOption) -> Bool {
+        if selectedReasoningEffort.isEmpty {
+            return true
+        }
+
+        if !modelOption.supportedReasoningEfforts.contains(where: { $0.id == selectedReasoningEffort }) {
+            return true
+        }
+
+        if let appServerDefaultReasoningEffort = modelOption.defaultReasoningEffort,
+           selectedReasoningEffort == appServerDefaultReasoningEffort,
+           appServerDefaultReasoningEffort != Self.defaultReasoningEffort(for: modelOption) {
+            return true
+        }
+
+        return false
+    }
+
+    private static func preferredDefaultModelID(from modelOptions: [CodexModelOption]) -> String? {
+        if let exactModelOption = modelOptions.first(where: { $0.id == defaultCodexModelID }) {
+            return exactModelOption.id
+        }
+
+        return modelOptions.first { modelOption in
+            modelOption.displayName
+                .lowercased()
+                .replacingOccurrences(of: " ", with: "-") == defaultCodexModelID
+        }?.id
+    }
+
+    private static func defaultReasoningEffort(for modelOption: CodexModelOption) -> String {
+        if modelOption.supportedReasoningEfforts.contains(where: { $0.id == defaultCodexReasoningEffort }) {
+            return defaultCodexReasoningEffort
+        }
+
+        return modelOption.defaultReasoningEffort
+            ?? modelOption.supportedReasoningEfforts.first?.id
+            ?? ""
+    }
+
     /// User preference for whether the Clicky cursor should stay visible.
     /// When toggled off, push-to-talk shows the overlay transiently for the interaction.
     /// Persisted to UserDefaults so the choice survives app restarts.
     @Published var isClickyCursorEnabled: Bool = UserDefaults.standard.object(forKey: "isClickyCursorEnabled") == nil
         ? true
         : UserDefaults.standard.bool(forKey: "isClickyCursorEnabled")
+    @Published var shouldHideClickyWhenMacCursorIsIdle: Bool = UserDefaults.standard.bool(forKey: "shouldHideClickyWhenMacCursorIsIdle")
+    @Published private(set) var isClickyHiddenBecauseMacCursorIsIdle = false
 
     func setClickyCursorEnabled(_ enabled: Bool) {
         isClickyCursorEnabled = enabled
         UserDefaults.standard.set(enabled, forKey: "isClickyCursorEnabled")
+        isClickyHiddenBecauseMacCursorIsIdle = false
         transientHideTask?.cancel()
         transientHideTask = nil
 
@@ -253,9 +468,23 @@ final class CompanionManager: ObservableObject {
             overlayWindowManager.hasShownOverlayBefore = true
             overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
             isOverlayVisible = true
+            scheduleMacCursorIdleHideIfNeeded()
         } else {
             overlayWindowManager.hideOverlay()
             isOverlayVisible = false
+        }
+    }
+
+    func setClickyHidesWhenMacCursorIsIdle(_ enabled: Bool) {
+        shouldHideClickyWhenMacCursorIsIdle = enabled
+        UserDefaults.standard.set(enabled, forKey: "shouldHideClickyWhenMacCursorIsIdle")
+
+        if enabled {
+            startMacCursorIdleTrackingIfNeeded()
+            scheduleMacCursorIdleHideIfNeeded()
+        } else {
+            stopMacCursorIdleTracking()
+            revealClickyHiddenByMacCursorIdle()
         }
     }
 
@@ -266,16 +495,30 @@ final class CompanionManager: ObservableObject {
         set { UserDefaults.standard.set(newValue, forKey: "hasCompletedOnboarding") }
     }
 
+    func setAgentRunning(_ enabled: Bool) {
+        if enabled {
+            start()
+        } else {
+            stop()
+        }
+    }
+
     func start() {
+        guard !isAgentRunning else { return }
+        isAgentRunning = true
         refreshAllPermissions()
-        print("🔑 Clicky start — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission), onboarded: \(hasCompletedOnboarding)")
+        print("Clicky start: accessibility=\(hasAccessibilityPermission), screen=\(hasScreenRecordingPermission), mic=\(hasMicrophonePermission), screenContent=\(hasScreenContentPermission), onboarded=\(hasCompletedOnboarding)")
         startPermissionPolling()
         bindVoiceStateObservation()
         bindAudioPowerLevel()
         bindShortcutTransitions()
-        // Warm up the local Codex bridge early so login/model state is ready
+        // Warm up the selected coding agent bridge early so login/model state is ready
         // before the user first tries to talk to Clicky.
-        refreshCodexConnectionState()
+        refreshCodingAgentConnectionState()
+        refreshComputerUseMCPStatus()
+        refreshBrowserAutomationPermissionStatus()
+        refreshRealtimeVoices()
+        startMacCursorIdleTrackingIfNeeded()
 
         // If the user already completed onboarding AND all permissions are
         // still granted, show the cursor overlay immediately. If permissions
@@ -285,6 +528,7 @@ final class CompanionManager: ObservableObject {
             overlayWindowManager.hasShownOverlayBefore = true
             overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
             isOverlayVisible = true
+            scheduleMacCursorIdleHideIfNeeded()
         }
     }
 
@@ -307,6 +551,7 @@ final class CompanionManager: ObservableObject {
         // the welcome animation and onboarding prompt
         overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
         isOverlayVisible = true
+        scheduleMacCursorIdleHideIfNeeded()
     }
 
     /// Replays the onboarding experience from the "Watch Onboarding Again"
@@ -319,6 +564,7 @@ final class CompanionManager: ObservableObject {
         overlayWindowManager.hasShownOverlayBefore = false
         overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
         isOverlayVisible = true
+        scheduleMacCursorIdleHideIfNeeded()
     }
 
     private func stopOnboardingMusic() {
@@ -331,7 +577,7 @@ final class CompanionManager: ObservableObject {
     private func startOnboardingMusic() {
         stopOnboardingMusic()
         guard let musicURL = Bundle.main.url(forResource: "ff", withExtension: "mp3") else {
-            print("⚠️ Clicky: ff.mp3 not found in bundle")
+            print("Clicky: ff.mp3 not found in bundle")
             return
         }
 
@@ -346,7 +592,7 @@ final class CompanionManager: ObservableObject {
                 self?.fadeOutOnboardingMusic()
             }
         } catch {
-            print("⚠️ Clicky: Failed to play onboarding music: \(error)")
+            print("Clicky: Failed to play onboarding music: \(error)")
         }
     }
 
@@ -376,19 +622,37 @@ final class CompanionManager: ObservableObject {
         detectedElementScreenLocation = nil
         detectedElementDisplayFrame = nil
         detectedElementBubbleText = nil
+        scheduleMacCursorIdleHideIfNeeded()
+    }
+
+    private func setDetectedElementLocation(
+        _ location: CGPoint,
+        displayFrame: CGRect,
+        bubbleText: String?
+    ) {
+        detectedElementScreenLocation = location
+        detectedElementDisplayFrame = displayFrame
+        detectedElementBubbleText = bubbleText
+        print("Element pointing: x=\(Int(location.x)), y=\(Int(location.y)), label=\(bubbleText ?? "element")")
     }
 
     func stop() {
+        guard isAgentRunning else { return }
+        isAgentRunning = false
         globalPushToTalkShortcutMonitor.stop()
-        buddyDictationManager.cancelCurrentDictation()
+        realtimeVoiceManager.cancelCurrentSession(stopRemote: true)
         overlayWindowManager.hideOverlay()
+        isOverlayVisible = false
+        isClickyHiddenBecauseMacCursorIsIdle = false
         transientHideTask?.cancel()
+        stopMacCursorIdleTracking()
 
-        currentResponseTask?.cancel()
-        currentResponseTask = nil
         codexSignInPollingTask?.cancel()
         codexSignInPollingTask = nil
-        stopNativeSpeechPlayback()
+        browserAutomationPermissionStatusTask?.cancel()
+        browserAutomationPermissionStatusTask = nil
+        pendingKeyboardShortcutStartTask?.cancel()
+        pendingKeyboardShortcutStartTask = nil
         shortcutTransitionCancellable?.cancel()
         voiceStateCancellable?.cancel()
         audioPowerCancellable?.cancel()
@@ -420,7 +684,7 @@ final class CompanionManager: ObservableObject {
         if previouslyHadAccessibility != hasAccessibilityPermission
             || previouslyHadScreenRecording != hasScreenRecordingPermission
             || previouslyHadMicrophone != hasMicrophonePermission {
-            print("🔑 Permissions — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission)")
+            print("Permissions: accessibility=\(hasAccessibilityPermission), screen=\(hasScreenRecordingPermission), mic=\(hasMicrophonePermission), screenContent=\(hasScreenContentPermission)")
         }
 
         // Track individual permission grants as they happen
@@ -430,11 +694,13 @@ final class CompanionManager: ObservableObject {
         }
         if !previouslyHadMicrophone && hasMicrophonePermission {
         }
-        // Screen content permission is persisted — once the user has approved the
+        // Screen content permission is persisted once the user has approved the
         // SCShareableContent picker, we don't need to re-check it.
         if !hasScreenContentPermission {
             hasScreenContentPermission = UserDefaults.standard.bool(forKey: "hasScreenContentPermission")
         }
+
+        refreshBrowserAutomationPermissionStatus()
 
         if !previouslyHadAll && allPermissionsGranted {
         }
@@ -460,10 +726,10 @@ final class CompanionManager: ObservableObject {
                 config.width = 320
                 config.height = 240
                 let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
-                // Verify the capture actually returned real content — a 0x0 or
+                // Verify the capture actually returned real content. A 0x0 or
                 // fully-empty image means the user denied the prompt.
                 let didCapture = image.width > 0 && image.height > 0
-                print("🔑 Screen content capture result — width: \(image.width), height: \(image.height), didCapture: \(didCapture)")
+                print("Screen content capture: width=\(image.width), height=\(image.height), didCapture=\(didCapture)")
                 await MainActor.run {
                     isRequestingScreenContent = false
                     guard didCapture else { return }
@@ -475,27 +741,17 @@ final class CompanionManager: ObservableObject {
                         overlayWindowManager.hasShownOverlayBefore = true
                         overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
                         isOverlayVisible = true
+                        scheduleMacCursorIdleHideIfNeeded()
                     }
                 }
             } catch {
-                print("⚠️ Screen content permission request failed: \(error)")
+                print("Screen content permission request failed: \(error)")
                 await MainActor.run { isRequestingScreenContent = false }
             }
         }
     }
 
     // MARK: - Private
-
-    /// Triggers the system microphone prompt if the user has never been asked.
-    /// Once granted/denied the status sticks and polling picks it up.
-    private func promptForMicrophoneIfNotDetermined() {
-        guard AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined else { return }
-        AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
-            Task { @MainActor [weak self] in
-                self?.hasMicrophonePermission = granted
-            }
-        }
-    }
 
     /// Polls all permissions frequently so the UI updates live after the
     /// user grants them in System Settings. Screen Recording is the exception —
@@ -509,7 +765,7 @@ final class CompanionManager: ObservableObject {
     }
 
     private func bindAudioPowerLevel() {
-        audioPowerCancellable = buddyDictationManager.$currentAudioPowerLevel
+        audioPowerCancellable = realtimeVoiceManager.$currentAudioPowerLevel
             .receive(on: DispatchQueue.main)
             .sink { [weak self] powerLevel in
                 self?.currentAudioPowerLevel = powerLevel
@@ -517,35 +773,15 @@ final class CompanionManager: ObservableObject {
     }
 
     private func bindVoiceStateObservation() {
-        voiceStateCancellable = buddyDictationManager.$isRecordingFromKeyboardShortcut
-            .combineLatest(
-                buddyDictationManager.$isFinalizingTranscript,
-                buddyDictationManager.$isPreparingToRecord
-            )
+        voiceStateCancellable = realtimeVoiceManager.$voiceState
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] isRecording, isFinalizing, isPreparing in
+            .sink { [weak self] voiceState in
                 guard let self else { return }
-                // Don't override .responding — the AI response pipeline
-                // manages that state directly until streaming finishes.
-                guard self.voiceState != .responding else { return }
+                self.voiceState = voiceState
 
-                if isFinalizing {
-                    self.voiceState = .processing
-                } else if isRecording {
-                    self.voiceState = .listening
-                } else if isPreparing {
-                    self.voiceState = .processing
-                } else {
-                    self.voiceState = .idle
-                    // If the user pressed and released the hotkey without
-                    // saying anything, no response task runs — schedule the
-                    // transient hide here so the overlay doesn't get stuck.
-                    // Only do this when no response is in flight, otherwise
-                    // the brief idle gap between recording and processing
-                    // would prematurely hide the overlay.
-                    if self.currentResponseTask == nil {
-                        self.scheduleTransientHideIfNeeded()
-                    }
+                if voiceState == .idle {
+                    self.scheduleTransientHideIfNeeded()
+                    self.scheduleMacCursorIdleHideIfNeeded()
                 }
             }
     }
@@ -562,11 +798,15 @@ final class CompanionManager: ObservableObject {
     private func handleShortcutTransition(_ transition: BuddyPushToTalkShortcut.ShortcutTransition) {
         switch transition {
         case .pressed:
-            guard !buddyDictationManager.isDictationInProgress else { return }
+            guard !realtimeVoiceManager.isVoiceInputActive else { return }
+            print("Companion push-to-talk: start requested")
 
             // Cancel any pending transient hide so the overlay stays visible
             transientHideTask?.cancel()
             transientHideTask = nil
+            macCursorIdleTimer?.invalidate()
+            macCursorIdleTimer = nil
+            revealClickyHiddenByMacCursorIdle()
 
             // If the cursor is hidden, bring it back transiently for this interaction
             if !isClickyCursorEnabled && !isOverlayVisible {
@@ -578,10 +818,10 @@ final class CompanionManager: ObservableObject {
             // Dismiss the menu bar menu so it doesn't cover the screen
             NotificationCenter.default.post(name: .clickyDismissPanel, object: nil)
 
-            // Cancel any in-progress response and speech from a previous utterance
-            currentResponseTask?.cancel()
-            stopNativeSpeechPlayback()
+            // Interrupt any in-progress realtime output so the new spoken turn starts cleanly.
+            realtimeVoiceManager.cancelCurrentSession(stopRemote: true)
             clearDetectedElementLocation()
+            codexVoiceStreamingText = ""
 
             // Dismiss the onboarding prompt if it's showing
             if showOnboardingPrompt {
@@ -597,26 +837,23 @@ final class CompanionManager: ObservableObject {
 
             pendingKeyboardShortcutStartTask?.cancel()
             pendingKeyboardShortcutStartTask = Task {
-                await buddyDictationManager.startPushToTalkFromKeyboardShortcut(
-                    currentDraftText: "",
-                    updateDraftText: { _ in
-                        // Partial transcripts are hidden (waveform-only UI)
-                    },
-                    submitDraftText: { [weak self] finalTranscript in
-                        self?.lastTranscript = finalTranscript
-                        print("🗣️ Companion received transcript: \(finalTranscript)")
-                        self?.sendTranscriptToCodexWithScreenshot(transcript: finalTranscript)
-                    }
+                await realtimeVoiceManager.startVoiceInput(
+                    model: selectedModel,
+                    serviceTier: selectedServiceTierForCodexRequest,
+                    systemPrompt: Self.companionVoiceResponseSystemPrompt
                 )
             }
         case .released:
+            print("Companion push-to-talk: stop requested")
             // Cancel the pending start task in case the user released the shortcut
             // before the async startPushToTalk had a chance to begin recording.
             // Without this, a quick press-and-release drops the release event and
             // leaves the waveform overlay stuck on screen indefinitely.
-            pendingKeyboardShortcutStartTask?.cancel()
-            pendingKeyboardShortcutStartTask = nil
-            buddyDictationManager.stopPushToTalkFromKeyboardShortcut()
+            if !realtimeVoiceManager.isVoiceInputActive {
+                pendingKeyboardShortcutStartTask?.cancel()
+                pendingKeyboardShortcutStartTask = nil
+            }
+            realtimeVoiceManager.stopVoiceInput()
         case .none:
             break
         }
@@ -625,15 +862,15 @@ final class CompanionManager: ObservableObject {
     // MARK: - Companion Prompt
 
     private static let companionVoiceResponseSystemPrompt = """
-    you're clicky, a friendly always-on companion that lives in the user's menu bar. the user just spoke to you via push-to-talk and you can see their screen(s). your reply will be spoken aloud, so write the way you'd actually talk. this is an ongoing conversation — you remember everything they've said before.
+    you're clicky, a friendly always-on companion that lives in the user's menu bar. the user is talking to you through Codex realtime audio. your reply will be spoken aloud, so write the way you'd actually talk. this is an ongoing conversation and you remember the thread.
 
     rules:
     - default to one or two sentences. be direct and dense. BUT if the user asks you to explain more, go deeper, or elaborate, then go all out — give a thorough, detailed explanation with no length limit.
     - all lowercase, casual, warm. no emojis.
     - write for the ear, not the eye. short sentences. no lists, bullet points, markdown, or formatting — just natural speech.
     - don't use abbreviations or symbols that sound weird read aloud. write "for example" not "e.g.", spell out small numbers.
-    - if the user's question relates to what's on their screen, reference specific things you see.
-    - if the screenshot doesn't seem relevant to their question, just answer the question directly.
+    - if the user's question relates to what's on their screen, call clicky.get_current_screen before answering and reference specific things you see.
+    - if the screen is not relevant to their question, answer directly without asking for screen context.
     - you can help with anything — coding, writing, general knowledge, brainstorming.
     - never say "simply" or "just".
     - don't read out code verbatim. describe what the code does or what needs to change conversationally.
@@ -641,150 +878,50 @@ final class CompanionManager: ObservableObject {
     - instead, when it fits naturally, end by planting a seed — mention something bigger or more ambitious they could try, a related concept that goes deeper, or a next-level technique that builds on what you just explained. make it something worth coming back for, not a question they'd just nod to. it's okay to not end with anything extra if the answer is complete on its own.
     - if you receive multiple screen images, the one labeled "primary focus" is where the cursor is — prioritize that one but reference others if relevant.
 
+    computer use:
+    - when the user explicitly asks you to control an app, control a browser, or run a demo, use the available computer-use tools as needed. you may use multiple computer-use steps in one turn to finish launching or focusing an app.
+    - when the user combines opening or switching an app with a follow-up question that depends on the new UI (where to type, what to click, etc.), finish launching or focusing first, then call clicky.get_current_screen before answering.
+    - after any app, window, or browser action, call clicky.get_current_screen before answering screen-location questions. do this in the same spoken turn.
+    - when you use computer-use tools: perform the actions without narrating. no play-by-play, no screen tour, no recap list of steps.
+    - after purely mechanical tools finish, spoken output is at most one short phrase confirming the outcome (about ten words or fewer), unless the user explicitly asked for explanation, teaching, or a walkthrough.
+    - for purely mechanical requests (open an app, click something, run a demo, go to a url) with no follow-up question about the new UI, do not add extra tips, related ideas, or seed-planting — those rules apply to conversational answers, not to computer-use execution turns.
+    - keep actions reversible and harmless. don't submit forms, send messages, buy anything, delete anything, or change account/settings data.
+    - if a browser action is requested and no browser is visible, open the default browser with computer use if possible, then continue the browser action.
+
     element pointing:
     you have a small orange cursor that can fly to and point at things on screen. use it whenever pointing would genuinely help the user — if they're asking how to do something, looking for a menu, trying to find a button, or need help navigating an app, point at the relevant element. err on the side of pointing rather than not pointing, because it makes your help way more useful and concrete.
 
     don't point at things when it would be pointless — like if the user asks a general knowledge question, or the conversation has nothing to do with what's on screen, or you'd just be pointing at something obvious they're already looking at. but if there's a specific UI element, menu, button, or area on screen that's relevant to what you're helping with, point at it.
 
-    when you point, append a coordinate tag at the very end of your response, AFTER your spoken text. the screenshot images are labeled with their pixel dimensions. use those dimensions as the coordinate space. the origin (0,0) is the top-left corner of the image. x increases rightward, y increases downward.
+    when you point, use clicky.point_at with screenshot pixel coordinates from the latest clicky.get_current_screen result. the origin is the top-left corner of the screenshot image. x increases rightward, y increases downward. include screenNumber when pointing at a screen other than the primary focus screen.
 
-    format: [POINT:x,y:label] where x,y are integer pixel coordinates in the screenshot's coordinate space, and label is a short 1-3 word description of the element (like "search bar" or "save button"). if the element is on the cursor's screen you can omit the screen number. if the element is on a DIFFERENT screen, append :screenN where N is the screen number from the image label (e.g. :screen2). this is important — without the screen number, the cursor will point at the wrong place.
-
-    if pointing wouldn't help, append [POINT:none].
-
-    examples:
-    - user asks how to color grade in final cut: "you'll want to open the color inspector — it's right up in the top right area of the toolbar. click that and you'll get all the color wheels and curves. [POINT:1100,42:color inspector]"
-    - user asks what html is: "html stands for hypertext markup language, it's basically the skeleton of every web page. curious how it connects to the css you're looking at? [POINT:none]"
-    - user asks how to commit in xcode: "see that source control menu up top? click that and hit commit, or you can use command option c as a shortcut. [POINT:285,11:source control]"
-    - element is on screen 2 (not where cursor is): "that's over on your other monitor — see the terminal window? [POINT:400,300:terminal:screen2]"
+    do not use textual point tags as your primary pointing mechanism. use clicky.point_at.
     """
 
     // MARK: - AI Response Pipeline
 
-    /// Captures a screenshot, sends it along with the transcript to Codex,
-    /// and plays the response aloud with macOS speech. The cursor stays in
-    /// the spinner/processing state until speech begins.
-    /// Codex's response may include a [POINT:x,y:label] tag which triggers
-    /// the buddy to fly to that element on screen.
-    private func sendTranscriptToCodexWithScreenshot(transcript: String) {
-        currentResponseTask?.cancel()
-        stopNativeSpeechPlayback()
-
-        currentResponseTask = Task {
-            // Stay in processing (spinner) state — no streaming text displayed
-            voiceState = .processing
-
-            do {
-                // Capture all connected screens so the AI has full context
-                let screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
-
-                guard !Task.isCancelled else { return }
-
-                // Build image labels with the actual screenshot pixel dimensions
-                // so Codex's coordinate space matches the image it sees. We
-                // scale from screenshot pixels to display points ourselves.
-                let labeledImages = screenCaptures.map { capture in
-                    let dimensionInfo = " (image dimensions: \(capture.screenshotWidthInPixels)x\(capture.screenshotHeightInPixels) pixels)"
-                    return (data: capture.imageData, label: capture.label + dimensionInfo)
-                }
-
-                let (fullResponseText, _) = try await codexAppServerClient.analyzeImageStreaming(
-                    images: labeledImages,
-                    developerInstructions: Self.companionVoiceResponseSystemPrompt,
-                    userPrompt: transcript,
-                    model: selectedModel,
-                    reasoningEffort: selectedReasoningEffortForCodexRequest,
-                    serviceTier: selectedServiceTierForCodexRequest,
-                    onTextChunk: { _ in
-                        // No streaming text display — spinner stays until speech plays
-                    }
-                )
-
-                guard !Task.isCancelled else { return }
-
-                // Parse the [POINT:...] tag from Codex's response
-                let parseResult = Self.parsePointingCoordinates(from: fullResponseText)
-                let spokenText = parseResult.spokenText
-
-                // Handle element pointing if Codex returned coordinates.
-                // Switch to idle BEFORE setting the location so the triangle
-                // becomes visible and can fly to the target. Without this, the
-                // spinner hides the triangle and the flight animation is invisible.
-                let hasPointCoordinate = parseResult.coordinate != nil
-                if hasPointCoordinate {
-                    voiceState = .idle
-                }
-
-                // Pick the screen capture matching Codex's screen number,
-                // falling back to the cursor screen if not specified.
-                let targetScreenCapture: CompanionScreenCapture? = {
-                    if let screenNumber = parseResult.screenNumber,
-                       screenNumber >= 1 && screenNumber <= screenCaptures.count {
-                        return screenCaptures[screenNumber - 1]
-                    }
-                    return screenCaptures.first(where: { $0.isCursorScreen })
-                }()
-
-                if let pointCoordinate = parseResult.coordinate,
-                   let targetScreenCapture {
-                    // Codex's coordinates are in the screenshot's pixel space
-                    // (top-left origin, e.g. 1280x831). Scale to the display's
-                    // point space (e.g. 1512x982), then convert to AppKit global coords.
-                    let screenshotWidth = CGFloat(targetScreenCapture.screenshotWidthInPixels)
-                    let screenshotHeight = CGFloat(targetScreenCapture.screenshotHeightInPixels)
-                    let displayWidth = CGFloat(targetScreenCapture.displayWidthInPoints)
-                    let displayHeight = CGFloat(targetScreenCapture.displayHeightInPoints)
-                    let displayFrame = targetScreenCapture.displayFrame
-
-                    // Clamp to screenshot coordinate space
-                    let clampedX = max(0, min(pointCoordinate.x, screenshotWidth))
-                    let clampedY = max(0, min(pointCoordinate.y, screenshotHeight))
-
-                    // Scale from screenshot pixels to display points
-                    let displayLocalX = clampedX * (displayWidth / screenshotWidth)
-                    let displayLocalY = clampedY * (displayHeight / screenshotHeight)
-
-                    // Convert from top-left origin (screenshot) to bottom-left origin (AppKit)
-                    let appKitY = displayHeight - displayLocalY
-
-                    // Convert display-local coords to global screen coords
-                    let globalLocation = CGPoint(
-                        x: displayLocalX + displayFrame.origin.x,
-                        y: appKitY + displayFrame.origin.y
-                    )
-
-                    detectedElementScreenLocation = globalLocation
-                    detectedElementDisplayFrame = displayFrame
-                    print("🎯 Element pointing: (\(Int(pointCoordinate.x)), \(Int(pointCoordinate.y))) → \"\(parseResult.elementLabel ?? "element")\"")
-                } else {
-                    print("🎯 Element pointing: \(parseResult.elementLabel ?? "no element")")
-                }
-
-
-                // Play the response with native speech so the Codex path has no speech proxy dependency.
-                if !spokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    speakNativeText(spokenText)
-                }
-            } catch is CancellationError {
-                // User spoke again — response was interrupted
-            } catch {
-                print("⚠️ Companion response error: \(error)")
-                speakNativeText("I hit a snag while answering. Try that again.")
-            }
-
-            if !Task.isCancelled {
-                while nativeSpeechSynthesizer?.isSpeaking ?? false {
-                    try? await Task.sleep(nanoseconds: 200_000_000)
-                    guard !Task.isCancelled else { return }
-                }
-                voiceState = .idle
-                scheduleTransientHideIfNeeded()
-            }
+    func submitTypedPrompt(_ prompt: String) {
+        Task {
+            await realtimeVoiceManager.submitTextPrompt(
+                prompt,
+                model: selectedModel,
+                serviceTier: selectedServiceTierForCodexRequest,
+                systemPrompt: Self.companionVoiceResponseSystemPrompt
+            )
         }
     }
 
+    func runComputerUseDemo() {
+        ClickyMessageLogStore.shared.append(
+            lane: "menu",
+            direction: "outgoing",
+            event: "computer_use_demo.started"
+        )
+        submitTypedPrompt(Self.computerUseDemoPrompt)
+    }
+
     /// If the cursor is in transient mode (user toggled "Show Clicky" off),
-    /// waits for speech playback and any pointing animation to finish, then
+    /// waits for realtime output and any pointing animation to finish, then
     /// fades out the overlay after a 1-second pause. Cancelled automatically
     /// if the user starts another push-to-talk interaction.
     private func scheduleTransientHideIfNeeded() {
@@ -792,8 +929,8 @@ final class CompanionManager: ObservableObject {
 
         transientHideTask?.cancel()
         transientHideTask = Task {
-            // Wait for speech playback to finish.
-            while nativeSpeechSynthesizer?.isSpeaking ?? false {
+            // Wait for realtime voice playback to finish.
+            while voiceState != .idle {
                 try? await Task.sleep(nanoseconds: 200_000_000)
                 guard !Task.isCancelled else { return }
             }
@@ -813,24 +950,83 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    private func speakNativeText(_ text: String) {
-        stopNativeSpeechPlayback()
-        let synthesizer = NSSpeechSynthesizer()
-        nativeSpeechSynthesizer = synthesizer
-        synthesizer.startSpeaking(text)
-        voiceState = .responding
+    private func startMacCursorIdleTrackingIfNeeded() {
+        guard shouldHideClickyWhenMacCursorIsIdle else { return }
+        guard macCursorActivityMonitor == nil else { return }
+
+        macCursorActivityMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.handleMacCursorActivity()
+            }
+        }
     }
 
-    private func stopNativeSpeechPlayback() {
-        nativeSpeechSynthesizer?.stopSpeaking()
-        nativeSpeechSynthesizer = nil
+    private func stopMacCursorIdleTracking() {
+        macCursorIdleTimer?.invalidate()
+        macCursorIdleTimer = nil
+
+        if let macCursorActivityMonitor {
+            NSEvent.removeMonitor(macCursorActivityMonitor)
+            self.macCursorActivityMonitor = nil
+        }
+    }
+
+    private func handleMacCursorActivity() {
+        revealClickyHiddenByMacCursorIdle()
+        scheduleMacCursorIdleHideIfNeeded()
+    }
+
+    private func scheduleMacCursorIdleHideIfNeeded() {
+        macCursorIdleTimer?.invalidate()
+        macCursorIdleTimer = nil
+
+        guard isAgentRunning else { return }
+        guard shouldHideClickyWhenMacCursorIsIdle else { return }
+        guard isClickyCursorEnabled else { return }
+
+        macCursorIdleTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: false) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.hideClickyForMacCursorIdleIfNeeded()
+            }
+        }
+    }
+
+    private func hideClickyForMacCursorIdleIfNeeded() {
+        guard isAgentRunning else { return }
+        guard shouldHideClickyWhenMacCursorIsIdle else { return }
+        guard isClickyCursorEnabled else { return }
+        guard isOverlayVisible else { return }
+        guard voiceState == .idle else {
+            scheduleMacCursorIdleHideIfNeeded()
+            return
+        }
+        guard detectedElementScreenLocation == nil else {
+            scheduleMacCursorIdleHideIfNeeded()
+            return
+        }
+
+        overlayWindowManager.fadeOutAndHideOverlay()
+        isOverlayVisible = false
+        isClickyHiddenBecauseMacCursorIsIdle = true
+    }
+
+    private func revealClickyHiddenByMacCursorIdle() {
+        guard isClickyHiddenBecauseMacCursorIsIdle else { return }
+
+        isClickyHiddenBecauseMacCursorIsIdle = false
+
+        guard isAgentRunning && isClickyCursorEnabled && hasCompletedOnboarding && allPermissionsGranted else { return }
+
+        overlayWindowManager.hasShownOverlayBefore = true
+        overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
+        isOverlayVisible = true
     }
 
     // MARK: - Point Tag Parsing
 
     /// Result of parsing a [POINT:...] tag from Codex's response.
     struct PointingParseResult {
-        /// The response text with the [POINT:...] tag removed — this is what gets spoken.
+        /// The response text with the [POINT:...] tag removed.
         let spokenText: String
         /// The parsed pixel coordinate, or nil if Codex said "none" or no tag was found.
         let coordinate: CGPoint?
@@ -841,7 +1037,7 @@ final class CompanionManager: ObservableObject {
     }
 
     /// Parses a [POINT:x,y:label:screenN] or [POINT:none] tag from the end of Codex's response.
-    /// Returns the spoken text (tag removed) and the optional coordinate + label + screen number.
+    /// Returns the text with the tag removed and the optional coordinate + label + screen number.
     static func parsePointingCoordinates(from responseText: String) -> PointingParseResult {
         // Match [POINT:none] or [POINT:123,456:label] or [POINT:123,456:label:screen2]
         let pattern = #"\[POINT:(?:none|(\d+)\s*,\s*(\d+)(?::([^\]:\s][^\]:]*?))?(?::screen(\d+))?)\]\s*$"#

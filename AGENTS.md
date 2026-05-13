@@ -7,7 +7,7 @@
 - Documentation-only validation: `git diff --check`.
 - Do not run `xcodebuild`; it can invalidate TCC permissions.
 
-Known upstream warnings about Swift 6 concurrency, deprecated `NSSpeechSynthesizer`, and deprecated SwiftUI `onChange` are not the current target. Do not fix them unless asked.
+Known upstream warnings about Swift 6 concurrency and deprecated SwiftUI `onChange` are not the current target. Do not fix them unless asked.
 
 ## Code Quality
 

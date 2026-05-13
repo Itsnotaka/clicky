@@ -3,6 +3,7 @@
 //  Codex app-server bridge used for streaming multimodal Clicky responses.
 //
 
+import AppKit
 import Foundation
 
 struct CodexModelOption: Identifiable, Equatable {
@@ -40,6 +41,217 @@ struct CodexAppServerSnapshot: Equatable {
     let defaultModelID: String?
 }
 
+struct CodexRealtimeVoiceOption: Identifiable, Equatable {
+    let id: String
+    let displayName: String
+    let generation: String
+    let isDefault: Bool
+}
+
+struct CodexRealtimeVoiceConfiguration: Equatable {
+    let options: [CodexRealtimeVoiceOption]
+    let defaultVoiceID: String?
+}
+
+struct CodexRealtimeAudioChunk {
+    let threadID: String
+    let data: Data
+    let sampleRate: Int
+    let channelCount: Int
+    let samplesPerChannel: Int?
+    let itemID: String?
+}
+
+enum CodexRealtimeEvent {
+    case started(threadID: String, sessionID: String?, version: String)
+    case outputAudioDelta(CodexRealtimeAudioChunk)
+    case transcriptDelta(threadID: String, role: String, delta: String)
+    case transcriptDone(threadID: String, role: String, text: String)
+    case error(threadID: String, message: String)
+    case closed(threadID: String, reason: String?)
+}
+
+struct CodexDynamicToolCall {
+    let threadID: String
+    let turnID: String
+    let callID: String
+    let namespace: String?
+    let tool: String
+    let arguments: [String: Any]
+}
+
+struct CodexDynamicToolResponse {
+    let contentItems: [[String: Any]]
+    let success: Bool
+
+    static func success(text: String) -> CodexDynamicToolResponse {
+        success(contentItems: [
+            [
+                "type": "inputText",
+                "text": text
+            ]
+        ])
+    }
+
+    static func success(contentItems: [[String: Any]]) -> CodexDynamicToolResponse {
+        CodexDynamicToolResponse(contentItems: contentItems, success: true)
+    }
+
+    static func failure(message: String) -> CodexDynamicToolResponse {
+        CodexDynamicToolResponse(
+            contentItems: [
+                [
+                    "type": "inputText",
+                    "text": message
+                ]
+            ],
+            success: false
+        )
+    }
+}
+
+struct CompanionComputerUseApprovalStoreSnapshot: Equatable {
+    enum State: Equatable {
+        case groupContainerMissing
+        case storeMissing
+        case present(byteCount: Int, modifiedAt: Date?)
+        case unreadable(String)
+    }
+
+    let fileURL: URL
+    let state: State
+
+    var statusText: String {
+        switch state {
+        case .groupContainerMissing:
+            return "Container missing"
+        case .storeMissing:
+            return "Not created yet"
+        case .present:
+            return "Present"
+        case .unreadable:
+            return "Unreadable"
+        }
+    }
+
+    var detailText: String {
+        switch state {
+        case .groupContainerMissing:
+            return "Codex Computer Use has not initialized its app-group container."
+        case .storeMissing:
+            return "No persistent app approval file exists yet."
+        case .present(let byteCount, let modifiedAt):
+            if let modifiedAt {
+                return "\(byteCount) bytes, modified \(modifiedAt.formatted(date: .abbreviated, time: .shortened))"
+            }
+            return "\(byteCount) bytes"
+        case .unreadable(let message):
+            return message
+        }
+    }
+}
+
+struct CompanionComputerUseMCPApprovalResult: Equatable {
+    let accepted: Bool
+    let appName: String?
+    let bundleIdentifier: String?
+    let action: String
+    let reason: String
+    let requestedPersistence: Bool
+    let createdAt: Date
+
+    var statusText: String {
+        accepted ? "Accepted" : "Declined"
+    }
+
+    var detailText: String {
+        let appText = appName ?? bundleIdentifier ?? "unknown app"
+        let persistenceText = requestedPersistence ? "persistent" : "session"
+        return "\(appText) - \(action), \(persistenceText): \(reason)"
+    }
+}
+
+struct CompanionComputerUseMCPStatus: Equatable {
+    enum DiscoveryState: Equatable {
+        case checking
+        case missingCodexApp
+        case missingPlugin
+        case missingMCPConfig
+        case missingClientExecutable
+        case ready
+    }
+
+    let discoveryState: DiscoveryState
+    let codexAppURL: URL?
+    let pluginDirectoryURL: URL?
+    let clientExecutableURL: URL?
+    let mcpServerFound: Bool
+    let mcpToolCount: Int
+    let approvalStore: CompanionComputerUseApprovalStoreSnapshot
+    let currentAppName: String?
+    let currentBundleIdentifier: String?
+    let lastApprovalResult: CompanionComputerUseMCPApprovalResult?
+    let lastRefreshErrorMessage: String?
+
+    static func checking() -> CompanionComputerUseMCPStatus {
+        let approvalStore = CodexAppServerClient.computerUseApprovalStoreSnapshot()
+        return CompanionComputerUseMCPStatus(
+            discoveryState: .checking,
+            codexAppURL: nil,
+            pluginDirectoryURL: nil,
+            clientExecutableURL: nil,
+            mcpServerFound: false,
+            mcpToolCount: 0,
+            approvalStore: approvalStore,
+            currentAppName: nil,
+            currentBundleIdentifier: nil,
+            lastApprovalResult: nil,
+            lastRefreshErrorMessage: nil
+        )
+    }
+
+    var isReadyForAppApproval: Bool {
+        discoveryState == .ready && mcpServerFound && lastRefreshErrorMessage == nil
+    }
+
+    var discoveryStatusText: String {
+        switch discoveryState {
+        case .checking:
+            return "Checking"
+        case .missingCodexApp:
+            return "Codex app missing"
+        case .missingPlugin:
+            return "Plugin missing"
+        case .missingMCPConfig:
+            return "MCP config missing"
+        case .missingClientExecutable:
+            return "Client missing"
+        case .ready:
+            return "Plugin ready"
+        }
+    }
+
+    var appApprovalStatusText: String {
+        if let lastRefreshErrorMessage, !lastRefreshErrorMessage.isEmpty {
+            return "Unavailable"
+        }
+        if isReadyForAppApproval {
+            return "Ready"
+        }
+        return discoveryStatusText
+    }
+
+    var appApprovalDetailText: String {
+        if let lastRefreshErrorMessage, !lastRefreshErrorMessage.isEmpty {
+            return lastRefreshErrorMessage
+        }
+        if isReadyForAppApproval {
+            return "Auto-allows the current focused app through MCP elicitation."
+        }
+        return "Codex Computer Use MCP is not ready yet."
+    }
+}
+
 enum CodexAppServerError: LocalizedError {
     case codexExecutableNotFound
     case invalidCodexExecutablePath(String)
@@ -72,6 +284,9 @@ enum CodexAppServerError: LocalizedError {
 actor CodexAppServerClient {
     static let shared = CodexAppServerClient()
 
+    typealias RealtimeEventHandler = @MainActor (CodexRealtimeEvent) async -> Void
+    typealias DynamicToolHandler = @MainActor (CodexDynamicToolCall) async -> CodexDynamicToolResponse
+
     private struct ProcessContext {
         let process: Process
         let stdinHandle: FileHandle
@@ -85,14 +300,29 @@ actor CodexAppServerClient {
         let turnStartedAt: Date
         let debugLogLabel: String?
         let onTextChunk: @MainActor @Sendable (String) -> Void
-        let continuation: CheckedContinuation<(text: String, duration: TimeInterval), Error>
+        let continuation: CheckedContinuation<(text: String, duration: TimeInterval, invokedComputerUseInteraction: Bool), Error>
         var accumulatedText: String
         var hasLoggedFirstTextChunk: Bool
+        var invokedComputerUseInteraction: Bool
     }
 
     private struct PendingRequest {
         let method: String
         let continuation: CheckedContinuation<Any, Error>
+    }
+
+    private struct ComputerUseMCPServerConfiguration {
+        let codexAppURL: URL
+        let pluginDirectoryURL: URL
+        let clientExecutableURL: URL
+        let command: String
+        let args: [String]
+        let cwd: String
+    }
+
+    private struct FrontmostApplicationSnapshot {
+        let name: String?
+        let bundleIdentifier: String?
     }
 
     private let session = URLSession(configuration: .default)
@@ -103,8 +333,11 @@ actor CodexAppServerClient {
     private var activeTurn: ActiveTurn?
     private var threadIDsByThreadConfiguration: [String: String] = [:]
     private var activeCodexExecutablePath: String?
+    private var lastComputerUseMCPApprovalResult: CompanionComputerUseMCPApprovalResult?
     private var stdoutBuffer = ""
     private var stderrBuffer = ""
+    private var realtimeEventHandler: RealtimeEventHandler?
+    private var dynamicToolHandler: DynamicToolHandler?
     private let requestTimeoutNanoseconds: UInt64 = 8_000_000_000
 
     private static func formattedLogDuration(_ duration: TimeInterval) -> String {
@@ -171,6 +404,53 @@ actor CodexAppServerClient {
         )
     }
 
+    func refreshComputerUseMCPStatus() async -> CompanionComputerUseMCPStatus {
+        let discovery = Self.computerUseMCPServerConfiguration()
+        let approvalStore = Self.computerUseApprovalStoreSnapshot()
+        let frontmostApplication = await Self.frontmostRegularApplicationSnapshot()
+
+        do {
+            try await ensureConnection()
+            let serverStatusResult = try await requestObject(
+                method: "mcpServerStatus/list",
+                params: ["detail": "toolsAndAuthOnly"]
+            )
+            let serverStatuses = serverStatusResult["data"] as? [[String: Any]] ?? []
+            let computerUseServerStatus = serverStatuses.first { serverStatus in
+                serverStatus["name"] as? String == "computer-use"
+            }
+            let tools = computerUseServerStatus?["tools"] as? [String: Any] ?? [:]
+
+            return CompanionComputerUseMCPStatus(
+                discoveryState: discovery.discoveryState,
+                codexAppURL: discovery.configuration?.codexAppURL,
+                pluginDirectoryURL: discovery.configuration?.pluginDirectoryURL,
+                clientExecutableURL: discovery.configuration?.clientExecutableURL,
+                mcpServerFound: computerUseServerStatus != nil,
+                mcpToolCount: tools.count,
+                approvalStore: approvalStore,
+                currentAppName: frontmostApplication?.name,
+                currentBundleIdentifier: frontmostApplication?.bundleIdentifier,
+                lastApprovalResult: lastComputerUseMCPApprovalResult,
+                lastRefreshErrorMessage: nil
+            )
+        } catch {
+            return CompanionComputerUseMCPStatus(
+                discoveryState: discovery.discoveryState,
+                codexAppURL: discovery.configuration?.codexAppURL,
+                pluginDirectoryURL: discovery.configuration?.pluginDirectoryURL,
+                clientExecutableURL: discovery.configuration?.clientExecutableURL,
+                mcpServerFound: false,
+                mcpToolCount: 0,
+                approvalStore: approvalStore,
+                currentAppName: frontmostApplication?.name,
+                currentBundleIdentifier: frontmostApplication?.bundleIdentifier,
+                lastApprovalResult: lastComputerUseMCPApprovalResult,
+                lastRefreshErrorMessage: error.localizedDescription
+            )
+        }
+    }
+
     func startChatGPTLogin() async throws -> URL {
         try await ensureConnection()
 
@@ -204,6 +484,117 @@ actor CodexAppServerClient {
         }
     }
 
+    func setRealtimeEventHandler(_ handler: RealtimeEventHandler?) {
+        realtimeEventHandler = handler
+    }
+
+    func setDynamicToolHandler(_ handler: DynamicToolHandler?) {
+        dynamicToolHandler = handler
+    }
+
+    func listRealtimeVoices() async throws -> CodexRealtimeVoiceConfiguration {
+        try await ensureConnection()
+
+        let response = try await requestObject(
+            method: "thread/realtime/listVoices",
+            params: [:]
+        )
+
+        return try Self.parseRealtimeVoiceConfiguration(from: response)
+    }
+
+    func ensureRealtimeThread(
+        developerInstructions: String,
+        model: String,
+        serviceTier: String?,
+        dynamicTools: [[String: Any]]
+    ) async throws -> String {
+        let snapshot = try await refreshSnapshot()
+        if snapshot.account.requiresOpenAIAuthentication && !snapshot.account.isSignedIn {
+            throw CodexAppServerError.accountAuthenticationRequired
+        }
+
+        return try await ensureThread(
+            developerInstructions: developerInstructions,
+            model: model,
+            serviceTier: serviceTier,
+            dynamicTools: dynamicTools
+        )
+    }
+
+    func startRealtimeSession(
+        threadID: String,
+        outputModality: String,
+        prompt: String?,
+        voiceID: String?
+    ) async throws {
+        var params: [String: Any] = [
+            "threadId": threadID,
+            "outputModality": outputModality,
+            "transport": [
+                "type": "websocket"
+            ]
+        ]
+
+        if let prompt {
+            params["prompt"] = prompt
+        }
+
+        if let voiceID, !voiceID.isEmpty {
+            params["voice"] = voiceID
+        }
+
+        _ = try await requestObject(
+            method: "thread/realtime/start",
+            params: params
+        )
+    }
+
+    func appendRealtimeAudio(
+        threadID: String,
+        audioData: Data,
+        sampleRate: Int,
+        channelCount: Int,
+        samplesPerChannel: Int?
+    ) async throws {
+        var audio: [String: Any] = [
+            "data": audioData.base64EncodedString(),
+            "sampleRate": sampleRate,
+            "numChannels": channelCount
+        ]
+
+        if let samplesPerChannel {
+            audio["samplesPerChannel"] = samplesPerChannel
+        }
+
+        _ = try await requestObject(
+            method: "thread/realtime/appendAudio",
+            params: [
+                "threadId": threadID,
+                "audio": audio
+            ]
+        )
+    }
+
+    func appendRealtimeText(threadID: String, text: String) async throws {
+        _ = try await requestObject(
+            method: "thread/realtime/appendText",
+            params: [
+                "threadId": threadID,
+                "text": text
+            ]
+        )
+    }
+
+    func stopRealtimeSession(threadID: String) async throws {
+        _ = try await requestObject(
+            method: "thread/realtime/stop",
+            params: [
+                "threadId": threadID
+            ]
+        )
+    }
+
     func analyzeImageStreaming(
         images: [(data: Data, label: String)],
         developerInstructions: String,
@@ -213,7 +604,7 @@ actor CodexAppServerClient {
         serviceTier: String?,
         debugLogLabel: String? = nil,
         onTextChunk: @escaping @MainActor @Sendable (String) -> Void
-    ) async throws -> (text: String, duration: TimeInterval) {
+    ) async throws -> (text: String, duration: TimeInterval, invokedComputerUseInteraction: Bool) {
         let requestStartedAt = Date()
         Self.printTiming(
             label: debugLogLabel,
@@ -297,7 +688,8 @@ actor CodexAppServerClient {
                 onTextChunk: onTextChunk,
                 continuation: continuation,
                 accumulatedText: "",
-                hasLoggedFirstTextChunk: false
+                hasLoggedFirstTextChunk: false,
+                invokedComputerUseInteraction: false
             )
         }
     }
@@ -372,7 +764,7 @@ actor CodexAppServerClient {
             throw CodexAppServerError.invalidResponse("Missing turn id.")
         }
 
-        return try await withCheckedThrowingContinuation { continuation in
+        let result = try await withCheckedThrowingContinuation { continuation in
             activeTurn = ActiveTurn(
                 turnID: turnID,
                 requestStartedAt: requestStartedAt,
@@ -381,9 +773,11 @@ actor CodexAppServerClient {
                 onTextChunk: onTextChunk,
                 continuation: continuation,
                 accumulatedText: "",
-                hasLoggedFirstTextChunk: false
+                hasLoggedFirstTextChunk: false,
+                invokedComputerUseInteraction: false
             )
         }
+        return (result.text, result.duration)
     }
 
     private func ensureConnection() async throws {
@@ -417,12 +811,10 @@ actor CodexAppServerClient {
 
         let process = Process()
         process.executableURL = codexExecutableURL
-        // Clicky owns its app-server tool surface; user-level MCP servers can be noisy or unavailable.
-        process.arguments = [
-            "app-server",
-            "-c", "mcp_servers={}",
-            "--listen", "stdio://"
-        ]
+        let computerUseMCPDiscovery = Self.computerUseMCPServerConfiguration()
+        process.arguments = Self.appServerArguments(
+            computerUseMCPServerConfiguration: computerUseMCPDiscovery.configuration
+        )
         process.environment = Self.processEnvironment(for: codexExecutableURL)
         process.currentDirectoryURL = appServerWorkingDirectoryURL
         process.standardInput = stdinPipe
@@ -458,6 +850,9 @@ actor CodexAppServerClient {
                         "name": "clicky",
                         "title": "Clicky",
                         "version": Self.clientVersion
+                    ],
+                    "capabilities": [
+                        "experimentalApi": true
                     ]
                 ]
             )
@@ -472,16 +867,26 @@ actor CodexAppServerClient {
     private func ensureThread(
         developerInstructions: String,
         model: String,
-        serviceTier: String?
+        serviceTier: String?,
+        dynamicTools: [[String: Any]]? = nil
     ) async throws -> String {
-        let threadConfigurationKey = model + "\n" + (serviceTier ?? "standard") + "\n" + developerInstructions
+        let dynamicToolsKey = Self.jsonConfigurationKey(dynamicTools ?? [])
+        let threadConfigurationKey = model + "\n" + (serviceTier ?? "standard") + "\n" + dynamicToolsKey + "\n" + developerInstructions
         if let existingThreadID = threadIDsByThreadConfiguration[threadConfigurationKey] {
             return existingThreadID
         }
 
         var threadParams: [String: Any] = [
             "model": model,
-            "approvalPolicy": "never",
+            "approvalPolicy": [
+                "granular": [
+                    "sandbox_approval": false,
+                    "rules": false,
+                    "skill_approval": false,
+                    "request_permissions": false,
+                    "mcp_elicitations": true
+                ]
+            ],
             "serviceName": "clicky",
             "developerInstructions": developerInstructions,
             "personality": "friendly",
@@ -490,6 +895,9 @@ actor CodexAppServerClient {
             "persistExtendedHistory": false
         ]
         threadParams["serviceTier"] = Self.serviceTierParameterValue(serviceTier)
+        if let dynamicTools, !dynamicTools.isEmpty {
+            threadParams["dynamicTools"] = dynamicTools
+        }
 
         let result = try await requestObject(
             method: "thread/start",
@@ -531,6 +939,15 @@ actor CodexAppServerClient {
 
     private static func serviceTierParameterValue(_ serviceTier: String?) -> Any {
         serviceTier ?? NSNull()
+    }
+
+    private static func jsonConfigurationKey(_ value: Any) -> String {
+        guard JSONSerialization.isValidJSONObject(value),
+              let data = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]),
+              let text = String(data: data, encoding: .utf8) else {
+            return String(describing: value)
+        }
+        return text
     }
 
     private func request(method: String, params: [String: Any]) async throws -> Any {
@@ -653,6 +1070,17 @@ actor CodexAppServerClient {
         }
 
         if let method = jsonObject["method"] as? String,
+           let requestID = jsonObject["id"],
+           !(requestID is NSNull) {
+            await handleServerRequest(
+                requestID: requestID,
+                method: method,
+                params: jsonObject["params"] as? [String: Any] ?? [:]
+            )
+            return
+        }
+
+        if let method = jsonObject["method"] as? String,
            let params = jsonObject["params"] as? [String: Any] {
             await handleNotification(method: method, params: params)
             return
@@ -688,8 +1116,365 @@ actor CodexAppServerClient {
         )
     }
 
+    private func handleServerRequest(requestID: Any, method: String, params: [String: Any]) async {
+        let result: [String: Any]
+
+        switch method {
+        case "mcpServer/elicitation/request":
+            result = await computerUseElicitationResponse(params: params)
+        case "item/tool/call":
+            result = await dynamicToolCallResponse(params: params)
+        default:
+            do {
+                try sendJSONLine([
+                    "jsonrpc": "2.0",
+                    "id": requestID,
+                    "error": [
+                        "code": -32601,
+                        "message": "Unsupported app-server request \(method)."
+                    ]
+                ])
+            } catch {
+                print("Warning: Codex app-server request response failed: \(error.localizedDescription)")
+            }
+            return
+        }
+
+        do {
+            try sendJSONLine([
+                "jsonrpc": "2.0",
+                "id": requestID,
+                "result": result
+            ])
+        } catch {
+            print("Warning: Codex app-server request response failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func dynamicToolCallResponse(params: [String: Any]) async -> [String: Any] {
+        guard let toolCall = Self.parseDynamicToolCall(from: params) else {
+            let response = CodexDynamicToolResponse.failure(message: "Clicky could not parse the dynamic tool call.")
+            return [
+                "contentItems": response.contentItems,
+                "success": response.success
+            ]
+        }
+
+        guard let dynamicToolHandler else {
+            let response = CodexDynamicToolResponse.failure(message: "Clicky has no dynamic tool handler registered.")
+            return [
+                "contentItems": response.contentItems,
+                "success": response.success
+            ]
+        }
+
+        let response = await dynamicToolHandler(toolCall)
+        return [
+            "contentItems": response.contentItems,
+            "success": response.success
+        ]
+    }
+
+    private func computerUseElicitationResponse(params: [String: Any]) async -> [String: Any] {
+        Self.logComputerUseElicitationReceived(params: params)
+
+        guard params["serverName"] as? String == "computer-use" else {
+            recordComputerUseMCPApprovalResult(
+                accepted: false,
+                app: nil,
+                action: "decline",
+                reason: "Elicitation was not from computer-use.",
+                requestedPersistence: false
+            )
+            return declinedElicitationResponse()
+        }
+
+        guard params["mode"] as? String == "form",
+              let requestedSchema = params["requestedSchema"] as? [String: Any] else {
+            recordComputerUseMCPApprovalResult(
+                accepted: false,
+                app: nil,
+                action: "decline",
+                reason: "Only form-mode Computer Use elicitations can be auto-approved.",
+                requestedPersistence: false
+            )
+            return declinedElicitationResponse()
+        }
+
+        guard let frontmostApplication = await Self.frontmostRegularApplicationSnapshot() else {
+            recordComputerUseMCPApprovalResult(
+                accepted: false,
+                app: nil,
+                action: "decline",
+                reason: "No regular frontmost app was available.",
+                requestedPersistence: false
+            )
+            return declinedElicitationResponse()
+        }
+
+        guard Self.elicitation(params: params, mentions: frontmostApplication) else {
+            recordComputerUseMCPApprovalResult(
+                accepted: false,
+                app: frontmostApplication,
+                action: "decline",
+                reason: "Requested app did not match the current focused app.",
+                requestedPersistence: false
+            )
+            return declinedElicitationResponse()
+        }
+
+        guard let content = Self.acceptedComputerUseElicitationContent(
+            from: requestedSchema,
+            for: frontmostApplication
+        ) else {
+            recordComputerUseMCPApprovalResult(
+                accepted: false,
+                app: frontmostApplication,
+                action: "decline",
+                reason: "Requested schema was not safely fillable.",
+                requestedPersistence: false
+            )
+            return declinedElicitationResponse()
+        }
+
+        let requestedPersistence = Self.contentRequestsPersistence(content)
+        recordComputerUseMCPApprovalResult(
+            accepted: true,
+            app: frontmostApplication,
+            action: "accept",
+            reason: "Requested app matched the current focused app.",
+            requestedPersistence: requestedPersistence
+        )
+        return [
+            "action": "accept",
+            "content": content,
+            "_meta": NSNull()
+        ]
+    }
+
+    private func declinedElicitationResponse() -> [String: Any] {
+        [
+            "action": "decline",
+            "content": NSNull(),
+            "_meta": NSNull()
+        ]
+    }
+
+    private func recordComputerUseMCPApprovalResult(
+        accepted: Bool,
+        app: FrontmostApplicationSnapshot?,
+        action: String,
+        reason: String,
+        requestedPersistence: Bool
+    ) {
+        let result = CompanionComputerUseMCPApprovalResult(
+            accepted: accepted,
+            appName: app?.name,
+            bundleIdentifier: app?.bundleIdentifier,
+            action: action,
+            reason: reason,
+            requestedPersistence: requestedPersistence,
+            createdAt: Date()
+        )
+        lastComputerUseMCPApprovalResult = result
+
+        if accepted {
+            markActiveTurnComputerUseInvoked()
+        }
+
+        ClickyMessageLogStore.shared.append(
+            lane: "computer-use",
+            direction: "event",
+            event: accepted ? "mcp_app_approval.accepted" : "mcp_app_approval.declined",
+            fields: [
+                "appName": app?.name ?? "unknown",
+                "bundleIdentifier": app?.bundleIdentifier ?? "unknown",
+                "action": action,
+                "reason": reason,
+                "requestedPersistence": "\(requestedPersistence)"
+            ]
+        )
+    }
+
+    private static let computerUseLogFieldMaxLength = 400
+
+    private static func logComputerUseElicitationReceived(params: [String: Any]) {
+        let serverName = trimmedNonEmptyString(params["serverName"]) ?? "unknown"
+        let mode = trimmedNonEmptyString(params["mode"]) ?? "unknown"
+        var fields: [String: String] = [
+            "serverName": serverName,
+            "mode": mode
+        ]
+        if let message = params["message"] as? String {
+            fields["message"] = truncateForComputerUseLogField(message)
+        }
+        if let elicitationID = trimmedNonEmptyString(params["elicitationId"])
+            ?? trimmedNonEmptyString(params["id"]) {
+            fields["elicitationId"] = truncateForComputerUseLogField(elicitationID)
+        }
+        if let requestedSchema = params["requestedSchema"] as? [String: Any] {
+            fields["requestedSchemaKeys"] = requestedSchema.keys.sorted().joined(separator: ",")
+        }
+        ClickyMessageLogStore.shared.append(
+            lane: "computer-use",
+            direction: "incoming",
+            event: "mcp_elicitation.received",
+            fields: fields
+        )
+    }
+
+    private static func computerUseLogSummaryForCompletedItem(_ item: [String: Any]) -> String {
+        let candidateKeys = ["name", "toolName", "tool", "callId", "status", "id", "mcpServer", "serverName"]
+        for key in candidateKeys {
+            if let string = item[key] as? String, !string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return truncateForComputerUseLogField(string)
+            }
+            if let number = item[key] {
+                let text = String(describing: number)
+                if !text.isEmpty {
+                    return truncateForComputerUseLogField(text)
+                }
+            }
+        }
+        let keysPreview = item.keys.sorted().prefix(12).joined(separator: ",")
+        return truncateForComputerUseLogField(keysPreview.isEmpty ? "no_keys" : "keys=\(keysPreview)")
+    }
+
+    private static func truncateForComputerUseLogField(_ text: String) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count > computerUseLogFieldMaxLength else {
+            return trimmed
+        }
+        let endIndex = trimmed.index(trimmed.startIndex, offsetBy: computerUseLogFieldMaxLength)
+        return String(trimmed[..<endIndex]) + "..."
+    }
+
+    private static func trimmedNonEmptyString(_ value: Any?) -> String? {
+        if let string = value as? String {
+            let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        return nil
+    }
+
+    private static func parseDynamicToolCall(from params: [String: Any]) -> CodexDynamicToolCall? {
+        guard let threadID = params["threadId"] as? String,
+              let turnID = params["turnId"] as? String,
+              let callID = params["callId"] as? String,
+              let tool = params["tool"] as? String else {
+            return nil
+        }
+
+        let namespace: String?
+        if params["namespace"] is NSNull {
+            namespace = nil
+        } else {
+            namespace = params["namespace"] as? String
+        }
+
+        let arguments = params["arguments"] as? [String: Any] ?? [:]
+        return CodexDynamicToolCall(
+            threadID: threadID,
+            turnID: turnID,
+            callID: callID,
+            namespace: namespace,
+            tool: tool,
+            arguments: arguments
+        )
+    }
+
+    private static func parseRealtimeAudioChunk(
+        threadID: String,
+        rawAudio: [String: Any]
+    ) -> CodexRealtimeAudioChunk? {
+        guard let base64Audio = rawAudio["data"] as? String,
+              let audioData = Data(base64Encoded: base64Audio),
+              let sampleRate = numericInt(rawAudio["sampleRate"]),
+              let channelCount = numericInt(rawAudio["numChannels"]) else {
+            return nil
+        }
+
+        return CodexRealtimeAudioChunk(
+            threadID: threadID,
+            data: audioData,
+            sampleRate: sampleRate,
+            channelCount: channelCount,
+            samplesPerChannel: numericInt(rawAudio["samplesPerChannel"]),
+            itemID: rawAudio["itemId"] as? String
+        )
+    }
+
+    private static func numericInt(_ value: Any?) -> Int? {
+        if let intValue = value as? Int {
+            return intValue
+        }
+        if let number = value as? NSNumber {
+            return number.intValue
+        }
+        if let string = value as? String {
+            return Int(string)
+        }
+        return nil
+    }
+
+    private func markActiveTurnComputerUseInvoked() {
+        guard var turn = activeTurn else { return }
+        turn.invokedComputerUseInteraction = true
+        activeTurn = turn
+    }
+
     private func handleNotification(method: String, params: [String: Any]) async {
         switch method {
+        case "thread/realtime/started":
+            guard let threadID = params["threadId"] as? String,
+                  let version = params["version"] as? String else {
+                return
+            }
+            await realtimeEventHandler?(
+                .started(
+                    threadID: threadID,
+                    sessionID: params["sessionId"] as? String,
+                    version: version
+                )
+            )
+
+        case "thread/realtime/outputAudio/delta":
+            guard let threadID = params["threadId"] as? String,
+                  let rawAudio = params["audio"] as? [String: Any],
+                  let audioChunk = Self.parseRealtimeAudioChunk(threadID: threadID, rawAudio: rawAudio) else {
+                return
+            }
+            await realtimeEventHandler?(.outputAudioDelta(audioChunk))
+
+        case "thread/realtime/transcript/delta":
+            guard let threadID = params["threadId"] as? String,
+                  let role = params["role"] as? String,
+                  let delta = params["delta"] as? String else {
+                return
+            }
+            await realtimeEventHandler?(.transcriptDelta(threadID: threadID, role: role, delta: delta))
+
+        case "thread/realtime/transcript/done":
+            guard let threadID = params["threadId"] as? String,
+                  let role = params["role"] as? String,
+                  let text = params["text"] as? String else {
+                return
+            }
+            await realtimeEventHandler?(.transcriptDone(threadID: threadID, role: role, text: text))
+
+        case "thread/realtime/error":
+            guard let threadID = params["threadId"] as? String,
+                  let message = params["message"] as? String else {
+                return
+            }
+            await realtimeEventHandler?(.error(threadID: threadID, message: message))
+
+        case "thread/realtime/closed":
+            guard let threadID = params["threadId"] as? String else {
+                return
+            }
+            await realtimeEventHandler?(.closed(threadID: threadID, reason: params["reason"] as? String))
+
         case "item/agentMessage/delta":
             guard var activeTurn,
                   let turnID = params["turnId"] as? String,
@@ -704,20 +1489,35 @@ actor CodexAppServerClient {
             await activeTurn.onTextChunk(activeTurn.accumulatedText)
 
         case "item/completed":
-            guard var activeTurn,
+            guard let activeTurn,
                   let turnID = params["turnId"] as? String,
                   turnID == activeTurn.turnID,
                   let item = params["item"] as? [String: Any],
-                  let itemType = item["type"] as? String,
-                  itemType == "agentMessage",
-                  let text = item["text"] as? String else {
+                  let itemType = item["type"] as? String else {
                 return
             }
 
-            activeTurn.accumulatedText = text
-            Self.logFirstTextChunkIfNeeded(activeTurn: &activeTurn, notificationName: method)
-            self.activeTurn = activeTurn
-            await activeTurn.onTextChunk(text)
+            if itemType == "agentMessage", let text = item["text"] as? String {
+                var updatedTurn = activeTurn
+                updatedTurn.accumulatedText = text
+                Self.logFirstTextChunkIfNeeded(activeTurn: &updatedTurn, notificationName: method)
+                self.activeTurn = updatedTurn
+                await updatedTurn.onTextChunk(text)
+                return
+            }
+
+            markActiveTurnComputerUseInvoked()
+
+            let summary = Self.computerUseLogSummaryForCompletedItem(item)
+            ClickyMessageLogStore.shared.append(
+                lane: "computer-use",
+                direction: "event",
+                event: "turn.item.completed",
+                fields: [
+                    "itemType": itemType,
+                    "summary": summary
+                ]
+            )
 
         case "turn/completed":
             guard let activeTurn,
@@ -738,7 +1538,11 @@ actor CodexAppServerClient {
                     label: activeTurn.debugLogLabel,
                     "turn completed turn=\(Self.formattedLogDuration(duration)) total=\(Self.formattedLogDuration(completedAt.timeIntervalSince(activeTurn.requestStartedAt))) responseChars=\(finalText.count)"
                 )
-                activeTurn.continuation.resume(returning: (text: finalText, duration: duration))
+                activeTurn.continuation.resume(returning: (
+                    text: finalText,
+                    duration: duration,
+                    invokedComputerUseInteraction: activeTurn.invokedComputerUseInteraction
+                ))
             } else {
                 Self.printTiming(
                     label: activeTurn.debugLogLabel,
@@ -816,6 +1620,417 @@ actor CodexAppServerClient {
         threadIDsByThreadConfiguration.removeAll()
     }
 
+    private static func appServerArguments(
+        computerUseMCPServerConfiguration: ComputerUseMCPServerConfiguration?
+    ) -> [String] {
+        var arguments = [
+            "app-server",
+            "--enable", "realtime_conversation",
+            "-c", "mcp_servers={}"
+        ]
+
+        if let computerUseMCPServerConfiguration {
+            arguments.append(contentsOf: [
+                "-c", "mcp_servers.computer-use.command=\(tomlString(computerUseMCPServerConfiguration.command))",
+                "-c", "mcp_servers.computer-use.args=\(tomlStringArray(computerUseMCPServerConfiguration.args))",
+                "-c", "mcp_servers.computer-use.cwd=\(tomlString(computerUseMCPServerConfiguration.cwd))"
+            ])
+        }
+
+        arguments.append(contentsOf: ["--listen", "stdio://"])
+        return arguments
+    }
+
+    private static func computerUseMCPServerConfiguration() -> (
+        configuration: ComputerUseMCPServerConfiguration?,
+        discoveryState: CompanionComputerUseMCPStatus.DiscoveryState
+    ) {
+        let fileManager = FileManager.default
+        guard let codexAppURL = codexAppURL() else {
+            return (nil, .missingCodexApp)
+        }
+
+        let pluginDirectoryURL = codexAppURL
+            .appendingPathComponent("Contents", isDirectory: true)
+            .appendingPathComponent("Resources", isDirectory: true)
+            .appendingPathComponent("plugins", isDirectory: true)
+            .appendingPathComponent("openai-bundled", isDirectory: true)
+            .appendingPathComponent("plugins", isDirectory: true)
+            .appendingPathComponent("computer-use", isDirectory: true)
+
+        var isDirectory = ObjCBool(false)
+        guard fileManager.fileExists(atPath: pluginDirectoryURL.path, isDirectory: &isDirectory),
+              isDirectory.boolValue else {
+            return (nil, .missingPlugin)
+        }
+
+        let mcpConfigURL = pluginDirectoryURL.appendingPathComponent(".mcp.json")
+        guard let mcpConfigData = try? Data(contentsOf: mcpConfigURL),
+              let mcpConfig = try? JSONSerialization.jsonObject(with: mcpConfigData) as? [String: Any],
+              let mcpServers = mcpConfig["mcpServers"] as? [String: Any],
+              let computerUseServer = mcpServers["computer-use"] as? [String: Any],
+              let command = computerUseServer["command"] as? String else {
+            return (nil, .missingMCPConfig)
+        }
+
+        let args = computerUseServer["args"] as? [String] ?? []
+        let configuredCwd = computerUseServer["cwd"] as? String ?? "."
+        let cwdURL = resolvedURL(path: configuredCwd, relativeTo: pluginDirectoryURL)
+        let clientExecutableURL = resolvedURL(path: command, relativeTo: cwdURL)
+
+        guard fileManager.isExecutableFile(atPath: clientExecutableURL.path) else {
+            return (nil, .missingClientExecutable)
+        }
+
+        return (
+            ComputerUseMCPServerConfiguration(
+                codexAppURL: codexAppURL,
+                pluginDirectoryURL: pluginDirectoryURL,
+                clientExecutableURL: clientExecutableURL,
+                command: command,
+                args: args,
+                cwd: cwdURL.path
+            ),
+            .ready
+        )
+    }
+
+    private static func codexAppURL() -> URL? {
+        NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.openai.codex")
+    }
+
+    private static func resolvedURL(path: String, relativeTo baseURL: URL) -> URL {
+        if path.hasPrefix("/") {
+            return URL(fileURLWithPath: path).standardizedFileURL
+        }
+        return baseURL.appendingPathComponent(path).standardizedFileURL
+    }
+
+    static func computerUseApprovalStoreSnapshot() -> CompanionComputerUseApprovalStoreSnapshot {
+        let fileManager = FileManager.default
+        let groupContainerURL = fileManager.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library", isDirectory: true)
+            .appendingPathComponent("Group Containers", isDirectory: true)
+            .appendingPathComponent("2DC432GLL2.com.openai.sky.CUAService", isDirectory: true)
+        let approvalStoreURL = groupContainerURL
+            .appendingPathComponent("Library", isDirectory: true)
+            .appendingPathComponent("Application Support", isDirectory: true)
+            .appendingPathComponent("Software", isDirectory: true)
+            .appendingPathComponent("ComputerUseAppApprovals.json")
+
+        var isDirectory = ObjCBool(false)
+        guard fileManager.fileExists(atPath: groupContainerURL.path, isDirectory: &isDirectory),
+              isDirectory.boolValue else {
+            return CompanionComputerUseApprovalStoreSnapshot(fileURL: approvalStoreURL, state: .groupContainerMissing)
+        }
+
+        guard fileManager.fileExists(atPath: approvalStoreURL.path) else {
+            return CompanionComputerUseApprovalStoreSnapshot(fileURL: approvalStoreURL, state: .storeMissing)
+        }
+
+        do {
+            let attributes = try fileManager.attributesOfItem(atPath: approvalStoreURL.path)
+            let byteCount = (attributes[.size] as? NSNumber)?.intValue ?? 0
+            let modifiedAt = attributes[.modificationDate] as? Date
+            return CompanionComputerUseApprovalStoreSnapshot(
+                fileURL: approvalStoreURL,
+                state: .present(byteCount: byteCount, modifiedAt: modifiedAt)
+            )
+        } catch {
+            return CompanionComputerUseApprovalStoreSnapshot(
+                fileURL: approvalStoreURL,
+                state: .unreadable(error.localizedDescription)
+            )
+        }
+    }
+
+    private static func tomlString(_ value: String) -> String {
+        let escapedValue = value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        return "\"\(escapedValue)\""
+    }
+
+    private static func tomlStringArray(_ values: [String]) -> String {
+        "[" + values.map(tomlString).joined(separator: ",") + "]"
+    }
+
+    private static func frontmostRegularApplicationSnapshot() async -> FrontmostApplicationSnapshot? {
+        await MainActor.run {
+            guard let application = NSWorkspace.shared.frontmostApplication,
+                  application.activationPolicy == .regular else {
+                return nil
+            }
+
+            return FrontmostApplicationSnapshot(
+                name: application.localizedName,
+                bundleIdentifier: application.bundleIdentifier
+            )
+        }
+    }
+
+    private static func elicitation(
+        params: [String: Any],
+        mentions application: FrontmostApplicationSnapshot
+    ) -> Bool {
+        let candidates = [
+            application.name,
+            application.bundleIdentifier
+        ]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            .filter { !$0.isEmpty }
+
+        guard !candidates.isEmpty else { return false }
+
+        let strings = jsonStringValues(params).map { $0.lowercased() }
+        return strings.contains { value in
+            candidates.contains { candidate in
+                value.contains(candidate)
+            }
+        }
+    }
+
+    private static func acceptedComputerUseElicitationContent(
+        from schema: [String: Any],
+        for application: FrontmostApplicationSnapshot
+    ) -> [String: Any]? {
+        guard let properties = schema["properties"] as? [String: Any] else {
+            return nil
+        }
+
+        let requiredPropertyNames = Set((schema["required"] as? [String]) ?? [])
+        var content: [String: Any] = [:]
+
+        for property in properties {
+            guard let propertySchema = property.value as? [String: Any],
+                  let value = elicitationValue(
+                    forPropertyName: property.key,
+                    propertySchema: propertySchema,
+                    application: application
+                  ) else {
+                continue
+            }
+            content[property.key] = value
+        }
+
+        for requiredPropertyName in requiredPropertyNames where content[requiredPropertyName] == nil {
+            return nil
+        }
+
+        return content
+    }
+
+    private static func elicitationValue(
+        forPropertyName propertyName: String,
+        propertySchema: [String: Any],
+        application: FrontmostApplicationSnapshot
+    ) -> Any? {
+        let context = normalizedPropertyContext(propertyName: propertyName, propertySchema: propertySchema)
+        let type = propertySchema["type"] as? String
+
+        if isAppIdentifierContext(context), stringOptions(from: propertySchema).isEmpty {
+            return application.bundleIdentifier ?? application.name
+        }
+
+        switch type {
+        case "boolean":
+            if isPersistenceContext(context) || isApprovalContext(context) {
+                return true
+            }
+            return propertySchema["default"] as? Bool
+
+        case "string":
+            let options = stringOptions(from: propertySchema)
+            if !options.isEmpty {
+                if isAppIdentifierContext(context),
+                   let appOption = preferredAppOption(options: options, application: application) {
+                    return appOption
+                }
+                if isPersistenceContext(context) || isApprovalContext(context),
+                   let durableApprovalOption = preferredOption(
+                    options: options,
+                    preferredTerms: ["always", "permanent", "persistent", "remember"],
+                    avoidedTerms: ["deny", "decline", "cancel", "reject"]
+                   ) {
+                    return durableApprovalOption
+                }
+                if isPersistenceContext(context),
+                   let persistenceOption = preferredOption(
+                    options: options,
+                    preferredTerms: ["always", "permanent", "persistent", "remember"],
+                    avoidedTerms: ["once", "session", "deny", "decline", "cancel"]
+                   ) {
+                    return persistenceOption
+                }
+                if let approvalOption = preferredOption(
+                    options: options,
+                    preferredTerms: ["allow", "approve", "authorized", "authorize", "accept", "yes", "grant"],
+                    avoidedTerms: ["deny", "decline", "cancel", "reject"]
+                ) {
+                    return approvalOption
+                }
+            }
+
+            if let defaultValue = propertySchema["default"] as? String {
+                return defaultValue
+            }
+            if isAppIdentifierContext(context) {
+                return application.bundleIdentifier ?? application.name
+            }
+            return nil
+
+        case "array":
+            guard let items = propertySchema["items"] as? [String: Any] else { return nil }
+            let options = stringOptions(from: items)
+            guard !options.isEmpty else { return propertySchema["default"] as? [String] }
+            if isPersistenceContext(context),
+               let persistenceOption = preferredOption(
+                options: options,
+                preferredTerms: ["always", "permanent", "persistent", "remember"],
+                avoidedTerms: ["once", "session", "deny", "decline", "cancel"]
+               ) {
+                return [persistenceOption]
+            }
+            return propertySchema["default"] as? [String]
+
+        default:
+            return nil
+        }
+    }
+
+    private static func normalizedPropertyContext(
+        propertyName: String,
+        propertySchema: [String: Any]
+    ) -> String {
+        [
+            propertyName,
+            propertySchema["title"] as? String,
+            propertySchema["description"] as? String
+        ]
+            .compactMap { $0 }
+            .joined(separator: " ")
+            .lowercased()
+    }
+
+    private static func isAppIdentifierContext(_ context: String) -> Bool {
+        containsAny(context, terms: ["bundle", "bundle identifier", "app name", "application"])
+    }
+
+    private static func isPersistenceContext(_ context: String) -> Bool {
+        containsAny(context, terms: ["persist", "persistence", "permanent", "always", "remember"])
+    }
+
+    private static func isApprovalContext(_ context: String) -> Bool {
+        containsAny(context, terms: ["approval", "allow", "authorize", "permission", "access", "use"])
+    }
+
+    private static func containsAny(_ value: String, terms: [String]) -> Bool {
+        terms.contains { value.contains($0) }
+    }
+
+    private static func stringOptions(from schema: [String: Any]) -> [(value: String, label: String)] {
+        if let oneOf = schema["oneOf"] as? [[String: Any]] {
+            return oneOf.compactMap { option in
+                guard let value = option["const"] as? String else { return nil }
+                return (value: value, label: option["title"] as? String ?? value)
+            }
+        }
+
+        if let anyOf = schema["anyOf"] as? [[String: Any]] {
+            return anyOf.compactMap { option in
+                guard let value = option["const"] as? String else { return nil }
+                return (value: value, label: option["title"] as? String ?? value)
+            }
+        }
+
+        if let enumValues = schema["enum"] as? [String] {
+            return enumValues.map { (value: $0, label: $0) }
+        }
+
+        return []
+    }
+
+    private static func preferredAppOption(
+        options: [(value: String, label: String)],
+        application: FrontmostApplicationSnapshot
+    ) -> String? {
+        let candidates = [application.bundleIdentifier, application.name]
+            .compactMap { $0?.lowercased() }
+            .filter { !$0.isEmpty }
+
+        return options.first { option in
+            let optionText = "\(option.value) \(option.label)".lowercased()
+            return candidates.contains { optionText.contains($0) }
+        }?.value
+    }
+
+    private static func preferredOption(
+        options: [(value: String, label: String)],
+        preferredTerms: [String],
+        avoidedTerms: [String]
+    ) -> String? {
+        if let preferredOption = options.first(where: { option in
+            let optionText = "\(option.value) \(option.label)".lowercased()
+            return preferredTerms.contains { optionText.contains($0) }
+        }) {
+            return preferredOption.value
+        }
+
+        return options.first { option in
+            let optionText = "\(option.value) \(option.label)".lowercased()
+            return !avoidedTerms.contains { optionText.contains($0) }
+        }?.value
+    }
+
+    private static func contentRequestsPersistence(_ content: [String: Any]) -> Bool {
+        content.contains { element in
+            let keyContext = element.key.lowercased()
+            let value = element.value
+            if isPersistenceContext(keyContext), let boolValue = value as? Bool {
+                return boolValue
+            }
+            if isPersistenceContext(keyContext), let stringValue = value as? String {
+                return containsAny(
+                    stringValue.lowercased(),
+                    terms: ["always", "permanent", "persistent", "remember"]
+                )
+            }
+            if let stringValue = value as? String {
+                return containsAny(
+                    stringValue.lowercased(),
+                    terms: ["always", "permanent", "persistent", "remember"]
+                )
+            }
+            if let stringValues = value as? [String] {
+                return stringValues.contains { stringValue in
+                    containsAny(
+                        stringValue.lowercased(),
+                        terms: ["always", "permanent", "persistent", "remember"]
+                    )
+                }
+            }
+            return false
+        }
+    }
+
+    private static func jsonStringValues(_ value: Any) -> [String] {
+        if let string = value as? String {
+            return [string]
+        }
+
+        if let dictionary = value as? [String: Any] {
+            return dictionary.flatMap { element in
+                [element.key] + jsonStringValues(element.value)
+            }
+        }
+
+        if let array = value as? [Any] {
+            return array.flatMap(jsonStringValues)
+        }
+
+        return []
+    }
+
     private static func parseAccountSnapshot(from result: [String: Any]) -> CodexAccountSnapshot {
         let requiresOpenAIAuthentication = result["requiresOpenaiAuth"] as? Bool ?? true
         let account = result["account"] as? [String: Any]
@@ -849,6 +2064,41 @@ actor CodexAppServerClient {
         }
     }
 
+    private static func parseRealtimeVoiceConfiguration(from result: [String: Any]) throws -> CodexRealtimeVoiceConfiguration {
+        let voicesObject = result["voices"] as? [String: Any] ?? result
+        let v1Voices = voicesObject["v1"] as? [String] ?? []
+        let v2Voices = voicesObject["v2"] as? [String] ?? []
+        let defaultV2Voice = voicesObject["defaultV2"] as? String
+        let defaultV1Voice = voicesObject["defaultV1"] as? String
+        let defaultVoiceID = defaultV2Voice ?? defaultV1Voice
+
+        let v2Options = v2Voices.map { voiceID in
+            CodexRealtimeVoiceOption(
+                id: voiceID,
+                displayName: displayName(forRealtimeVoice: voiceID, generation: "V2"),
+                generation: "v2",
+                isDefault: voiceID == defaultVoiceID
+            )
+        }
+        let v1Options = v1Voices.map { voiceID in
+            CodexRealtimeVoiceOption(
+                id: voiceID,
+                displayName: displayName(forRealtimeVoice: voiceID, generation: "V1"),
+                generation: "v1",
+                isDefault: voiceID == defaultVoiceID
+            )
+        }
+
+        let options = v2Options + v1Options.filter { v1Option in
+            !v2Options.contains(where: { $0.id == v1Option.id })
+        }
+
+        return CodexRealtimeVoiceConfiguration(
+            options: options,
+            defaultVoiceID: defaultVoiceID
+        )
+    }
+
     private static func parseReasoningEffortOptions(from rawModel: [String: Any]) -> [CodexReasoningEffortOption] {
         guard let rawReasoningEfforts = rawModel["supportedReasoningEfforts"] as? [[String: Any]] else {
             return []
@@ -865,6 +2115,17 @@ actor CodexAppServerClient {
                 description: rawReasoningEffort["description"] as? String ?? ""
             )
         }
+    }
+
+    private static func displayName(forRealtimeVoice voiceID: String, generation: String) -> String {
+        let spaced = voiceID
+            .replacingOccurrences(of: "-", with: " ")
+            .split(separator: " ")
+            .map { word in
+                word.prefix(1).uppercased() + word.dropFirst()
+            }
+            .joined(separator: " ")
+        return "\(spaced) \(generation)"
     }
 
     private static func displayName(forReasoningEffort reasoningEffort: String) -> String {
@@ -1003,6 +2264,7 @@ actor CodexAppServerClient {
         var environment = ProcessInfo.processInfo.environment
         let homeDirectoryPath = FileManager.default.homeDirectoryForCurrentUser.path
         let codexDirectoryPath = codexExecutableURL.deletingLastPathComponent().path
+        let nodeDirectoryPaths = nodeExecutableDirectoryPaths(homeDirectoryPath: homeDirectoryPath)
         let existingPathEntries = (environment["PATH"] ?? "")
             .split(separator: ":")
             .map(String.init)
@@ -1010,6 +2272,7 @@ actor CodexAppServerClient {
         let pathEntries = [
             codexDirectoryPath,
             "\(homeDirectoryPath)/Library/pnpm",
+        ] + nodeDirectoryPaths + [
             "\(homeDirectoryPath)/.vite-plus/bin",
             "\(homeDirectoryPath)/.volta/bin",
             "\(homeDirectoryPath)/.local/bin",
@@ -1028,6 +2291,62 @@ actor CodexAppServerClient {
         environment["HOME"] = environment["HOME"] ?? homeDirectoryPath
 
         return environment
+    }
+
+    private static func nodeExecutableDirectoryPaths(homeDirectoryPath: String) -> [String] {
+        let fileManager = FileManager.default
+        let homeDirectoryURL = URL(fileURLWithPath: homeDirectoryPath, isDirectory: true)
+        var candidateDirectoryURLs = [
+            homeDirectoryURL.appendingPathComponent("Library/pnpm", isDirectory: true),
+            homeDirectoryURL.appendingPathComponent(".local/share/fnm/aliases/default/bin", isDirectory: true),
+            homeDirectoryURL.appendingPathComponent(".local/share/fnm/aliases/lts-latest/bin", isDirectory: true)
+        ]
+
+        let fnmMultishellsDirectoryURL = homeDirectoryURL.appendingPathComponent(".local/state/fnm_multishells", isDirectory: true)
+        candidateDirectoryURLs.append(contentsOf: childDirectoryURLs(at: fnmMultishellsDirectoryURL).map {
+            $0.appendingPathComponent("bin", isDirectory: true)
+        })
+
+        let fnmNodeVersionsDirectoryURL = homeDirectoryURL.appendingPathComponent(".local/share/fnm/node-versions", isDirectory: true)
+        candidateDirectoryURLs.append(contentsOf: childDirectoryURLs(at: fnmNodeVersionsDirectoryURL)
+            .sorted { lhs, rhs in
+                lhs.lastPathComponent.localizedStandardCompare(rhs.lastPathComponent) == .orderedDescending
+            }
+            .map {
+                $0.appendingPathComponent("installation/bin", isDirectory: true)
+            })
+
+        let nvmNodeVersionsDirectoryURL = homeDirectoryURL.appendingPathComponent(".nvm/versions/node", isDirectory: true)
+        candidateDirectoryURLs.append(contentsOf: childDirectoryURLs(at: nvmNodeVersionsDirectoryURL)
+            .sorted { lhs, rhs in
+                lhs.lastPathComponent.localizedStandardCompare(rhs.lastPathComponent) == .orderedDescending
+            }
+            .map {
+                $0.appendingPathComponent("bin", isDirectory: true)
+            })
+
+        let paths = candidateDirectoryURLs
+            .map { $0.standardizedFileURL.path }
+            .filter { directoryPath in
+                fileManager.isExecutableFile(atPath: URL(fileURLWithPath: directoryPath, isDirectory: true).appendingPathComponent("node").path)
+            }
+
+        return Array(NSOrderedSet(array: paths)).compactMap { $0 as? String }
+    }
+
+    private static func childDirectoryURLs(at directoryURL: URL) -> [URL] {
+        do {
+            return try FileManager.default.contentsOfDirectory(
+                at: directoryURL,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            ).filter { childURL in
+                var isDirectory: ObjCBool = false
+                return FileManager.default.fileExists(atPath: childURL.path, isDirectory: &isDirectory) && isDirectory.boolValue
+            }
+        } catch {
+            return []
+        }
     }
 
     private static var clientVersion: String {

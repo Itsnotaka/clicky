@@ -8,11 +8,12 @@ Main macOS app target. Follow the root `AGENTS.md` first.
 - Do not run `xcodebuild`; use Xcode with the `leanring-buddy` scheme.
 - Do not add or run tests unless the user explicitly asks.
 
-## Transcription
+## Voice
 
-- Apple Speech is the supported speech-to-text backend.
-- Do not use Codex realtime conversation APIs for dictation.
-- Do not add direct OpenAI REST transcription without explicit request.
+- Codex realtime is the supported voice backend.
+- Do not add Apple Speech dictation or `NSSpeechSynthesizer` playback to the push-to-talk path.
+- Do not add Claude, direct OpenAI REST transcription, or proxy speech services without explicit request.
+- Keep `clicky.get_current_screen` and `clicky.point_at` as app-owned realtime tools for fresh screen context and pointing.
 
 ## UI Rules
 

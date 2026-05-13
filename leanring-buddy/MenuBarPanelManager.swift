@@ -237,6 +237,36 @@ final class MenuBarPanelManager: NSObject {
             fastModeItem.isEnabled = companionManager.selectedModelSupportsFastMode
             menu.addItem(fastModeItem)
         }
+
+        let realtimeStatusItem = NSMenuItem(title: "Realtime: \(companionManager.realtimeVoiceStatusText)", action: #selector(refreshRealtimeVoicesMenuItemSelected), keyEquivalent: "")
+        realtimeStatusItem.target = self
+        realtimeStatusItem.isEnabled = true
+        menu.addItem(realtimeStatusItem)
+
+        let voiceItem = NSMenuItem(title: "Voice: \(companionManager.realtimeVoiceDisplayName)", action: nil, keyEquivalent: "")
+        let voiceMenu = NSMenu()
+        if companionManager.realtimeVoiceOptions.isEmpty {
+            let refreshItem = NSMenuItem(title: "Refresh Voices", action: #selector(refreshRealtimeVoicesMenuItemSelected), keyEquivalent: "")
+            refreshItem.target = self
+            refreshItem.isEnabled = true
+            voiceMenu.addItem(refreshItem)
+        } else {
+            for voiceOption in companionManager.realtimeVoiceOptions {
+                let item = NSMenuItem(title: voiceOption.displayName, action: #selector(realtimeVoiceMenuItemSelected(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = voiceOption.id
+                item.state = voiceOption.id == companionManager.selectedRealtimeVoice ? .on : .off
+                item.isEnabled = true
+                voiceMenu.addItem(item)
+            }
+        }
+        voiceItem.submenu = voiceMenu
+        menu.addItem(voiceItem)
+
+        let computerUseDemoItem = NSMenuItem(title: "Run Computer Use Demo", action: #selector(runComputerUseDemoMenuItemSelected), keyEquivalent: "")
+        computerUseDemoItem.target = self
+        computerUseDemoItem.isEnabled = companionManager.isComputerUseDemoMenuEnabled
+        menu.addItem(computerUseDemoItem)
     }
 
     private var fastModeMenuTitle: String {
@@ -335,6 +365,24 @@ final class MenuBarPanelManager: NSObject {
 
     @objc private func fastModeMenuItemSelected() {
         companionManager.setFastModeEnabled(!companionManager.isFastModeEnabled)
+    }
+
+    @objc private func refreshRealtimeVoicesMenuItemSelected() {
+        companionManager.refreshRealtimeVoices()
+    }
+
+    @objc private func realtimeVoiceMenuItemSelected(_ sender: NSMenuItem) {
+        guard let voiceID = sender.representedObject as? String else { return }
+        companionManager.setSelectedRealtimeVoice(voiceID)
+    }
+
+    @objc private func runComputerUseDemoMenuItemSelected() {
+        statusMenu?.cancelTracking()
+
+        Task { @MainActor [companionManager] in
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            companionManager.runComputerUseDemo()
+        }
     }
 
     @objc private func grantMicrophoneMenuItemSelected() {

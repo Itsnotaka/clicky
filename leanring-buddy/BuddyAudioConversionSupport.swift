@@ -2,7 +2,7 @@
 //  BuddyAudioConversionSupport.swift
 //  leanring-buddy
 //
-//  Shared audio conversion helpers for voice transcription providers.
+//  Shared audio conversion helpers for realtime voice audio.
 //
 
 import AVFoundation
